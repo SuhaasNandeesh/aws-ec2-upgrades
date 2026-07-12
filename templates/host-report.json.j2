@@ -1,0 +1,27 @@
+{
+  "date": "{{ host_report.date }}",
+  "account": "{{ host_report.account }}",
+  "host": "{{ host_report.host }}",
+  "instance_id": "{{ host_report.instance_id }}",
+  "status": "{{ host_report.status }}",
+  "skip_reason": {{ host_report.skip_reason | to_nice_json_safe }},
+  "snapshot_id": "{{ host_report.snapshot_id | default('') }}",
+  "pre_snapshot": {
+    "running_services": {{ host_report.pre_snapshot.running_services | to_nice_json_safe }},
+    "enabled_stopped": {{ host_report.pre_snapshot.enabled_stopped | to_nice_json_safe }},
+    "docker": {{ host_report.pre_snapshot.docker | to_nice_json_safe }},
+    "kernel": "{{ host_report.pre_snapshot.kernel }}"
+  },
+  "upgraded": {{ host_report.upgraded | to_nice_json_safe }},
+  "rebooted": {{ host_report.rebooted | to_json }},
+  "post_snapshot": {
+    "running_services": {{ host_report.post_snapshot.running_services | to_nice_json_safe }},
+    "enabled_stopped": {{ host_report.post_snapshot.enabled_stopped | to_nice_json_safe }},
+    "docker": {{ host_report.post_snapshot.docker | to_nice_json_safe }},
+    "kernel": "{{ host_report.post_snapshot.kernel }}"
+  },
+  "service_drift": {{ host_report.service_drift | to_nice_json_safe }},
+  "docker_drift": {{ host_report.docker_drift | to_nice_json_safe }},
+  "kernel_changed": {{ host_report.kernel_changed | to_json }},
+  "verified": {{ host_report.verified | to_json }}
+}

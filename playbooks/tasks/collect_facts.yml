@@ -1,0 +1,158 @@
+---
+# playbooks/tasks/collect_facts.yml
+# Collects pre or post snapshot facts from the instance.
+# Expects:
+#   - snapshot_phase: "pre" or "post"
+# Sets facts:
+#   - {{ snapshot_phase }}_running_services: list[str]
+#   - {{ snapshot_phase }}_enabled_stopped: list[str]
+#   - {{ snapshot_phase }}_docker_containers: list[dict]
+#   - {{ snapshot_phase }}_kernel: str
+#   - {{ snapshot_phase }}_package_versions: dict[str,str]
+
+- name: Gather running services
+  ansible.builtin.service_facts:
+  no_log: true
+
+- name: Extract running service names (systemd dict structure)
+  ansible.builtin.set_fact:
+    _running_services: >-
+      {%
+        set running = []
+      -%}
+      {%
+        for name, info in ansible_facts.services.items()
+      -%}
+        {%
+          if info is mapping and info.state is defined and info.state == 'running'
+        -%}
+          {%
+            set _ = running.append(name)
+          -%}
+        {%
+          elif info is string and info == 'running'
+        -%}
+          {%
+            set _ = running.append(name)
+          -%}
+        {%
+          endif
+      -%}
+      {%
+        endfor
+      -%}
+      {{ running }}
+
+- name: Gather enabled-but-stopped systemd units
+  ansible.builtin.shell:
+    cmd: >
+      systemctl list-unit-files --state=enabled --type=service --no-legend --no-pager
+      | awk '{print $1}'
+      | sed 's/\.service$//'
+  register: _enabled_units_raw
+  changed_when: false
+
+- name: Extract enabled-stopped services
+  ansible.builtin.set_fact:
+    _enabled_stopped: >-
+      {{
+        _enabled_units_raw.stdout_lines
+        | map('trim')
+        | reject('match', '^$')
+        | list
+        | difference(_running_services)
+      }}
+
+- name: Check if docker is present
+  ansible.builtin.command: which docker
+  register: _docker_check
+  changed_when: false
+  failed_when: false
+
+- name: List running docker containers (by name)
+  ansible.builtin.shell:
+    cmd: docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null || true
+  register: _docker_raw
+  changed_when: false
+  when: _docker_check.rc == 0
+
+- name: Parse docker containers
+  ansible.builtin.set_fact:
+    _docker_containers: >-
+      {%
+        set containers = []
+      -%}
+      {%
+        if _docker_raw is defined and _docker_raw.stdout
+      -%}
+        {%
+          for line in _docker_raw.stdout_lines
+        -%}
+          {%
+            set parts = line.split('\t')
+          -%}
+          {%
+            set _ = containers.append({'name': parts[0], 'image': parts[1] | default('')})
+          -%}
+        {%
+          endfor
+        -%}
+      {%
+        endif
+      -%}
+      {{ containers }}
+  when: _docker_check.rc == 0
+
+- name: Set empty docker containers if docker absent
+  ansible.builtin.set_fact:
+    _docker_containers: []
+  when: _docker_check.rc != 0
+
+- name: Read current kernel
+  ansible.builtin.command: uname -r
+  register: _kernel_raw
+  changed_when: false
+
+- name: Parse /var/lib/dpkg/status into package versions (lightweight)
+  ansible.builtin.shell:
+    cmd: |
+      awk '/^Package:/ { pkg=$2 }
+           /^Status:/ { if ($3 != "installed") pkg="" }
+           /^Version:/ { if (pkg) print pkg "\t" $2; pkg="" }' /var/lib/dpkg/status
+  register: _pkg_raw
+  changed_when: false
+
+- name: Build package version dict
+  ansible.builtin.set_fact:
+    _package_versions: >-
+      {%
+        set pkgs = {}
+      -%}
+      {%
+        for line in _pkg_raw.stdout_lines
+      -%}
+        {%
+          set parts = line.split('\t')
+        -%}
+        {%
+          if parts | length >= 2
+        -%}
+          {%
+            set _ = pkgs.__setitem__(parts[0], parts[1])
+          -%}
+        {%
+          endif
+      -%}
+      {%
+        endfor
+      -%}
+      {{ pkgs }}
+
+- name: Set snapshot facts for this phase
+  ansible.builtin.set_fact:
+    "{{ snapshot_phase }}_running_services": "{{ _running_services }}"
+    "{{ snapshot_phase }}_enabled_stopped": "{{ _enabled_stopped }}"
+    "{{ snapshot_phase }}_docker_containers": "{{ _docker_containers }}"
+    "{{ snapshot_phase }}_kernel": "{{ _kernel_raw.stdout | trim }}"
+    "{{ snapshot_phase }}_package_versions": "{{ _package_versions }}"
+    cacheable: true

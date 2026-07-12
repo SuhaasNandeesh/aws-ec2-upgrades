@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# Ansible collections (installed via requirements.yml)
+collections/
+
+# Generated reports
+reports/
+
+# Retry files
+*.retry
+
+# Sensitive local config
+accounts.yml
+inventory/targets.yml
+inventory/group_vars/prod.yml
+inventory/group_vars/nonprod.yml
+
+# OS
+.DS_Store
+
+# Editor / IDE
+.claude/

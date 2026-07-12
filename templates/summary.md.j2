@@ -1,0 +1,49 @@
+# Patch Run Summary: {{ summary.date }}
+
+## Overview
+
+- **Date:** {{ summary.date }}
+- **Accounts:** {{ summary.accounts | join(', ') }}
+- **Total hosts targeted:** {{ summary.total_hosts }}
+- **Hosts patched:** {{ summary.hosts_patched }}
+- **Hosts skipped:** {{ summary.hosts_skipped }}
+- **Hosts with errors:** {{ summary.hosts_errors }}
+- **Hosts with service drift:** {{ summary.hosts_with_drift }}
+
+## Per-Account Breakdown
+
+{% for acct in summary.per_account %}
+### {{ acct.account }}
+
+- **Targeted:** {{ acct.total }}
+- **Patched:** {{ acct.patched }}
+- **Skipped:** {{ acct.skipped }}
+- **Errors:** {{ acct.errors }}
+- **Total packages upgraded across fleet:** {{ acct.total_upgrades }}
+
+{% if acct.skipped_hosts %}
+**Skipped hosts:**
+{% for h in acct.skipped_hosts %}
+  - `{{ h }}`
+{% endfor %}
+{% endif %}
+
+{% if acct.drift_hosts %}
+**Hosts with service drift:**
+{% for h in acct.drift_hosts %}
+  - `{{ h }}`
+{% endfor %}
+{% endif %}
+{% endfor %}
+
+## All Upgraded Packages (across fleet)
+
+{% if summary.all_upgrades %}
+| Package | Old Version | New Version |
+|---------|------------|-------------|
+{% for pkg in summary.all_upgrades %}
+| {{ pkg.name }} | {{ pkg.old }} | {{ pkg.new }} |
+{% endfor %}
+{% else %}
+No packages were upgraded.
+{% endif %}

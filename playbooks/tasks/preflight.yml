@@ -1,0 +1,167 @@
+---
+# playbooks/tasks/preflight.yml
+# Tasks to determine which hosts are reachable via SSM and optionally
+# bootstrap the SSM IAM instance profile for those that aren't.
+#
+# Expects:
+#   - inventory_hostname == instance ID
+#   - bootstrap (bool): whether to auto-attach SSM role
+#   - aws_region (str)
+#   - aws_profile (str): named AWS profile to use
+#
+# Sets facts:
+#   - preflight_status: "ready" | "skipped" | "bootstrapped" | "error"
+#   - preflight_reason: short string
+
+- name: Lookup EC2 instance info
+  amazon.aws.ec2_instance_info:
+    instance_ids:
+      - "{{ inventory_hostname }}"
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+  register: ec2_info
+  delegate_to: localhost
+  become: false
+  retries: 3
+  delay: 10
+  until: ec2_info is not failed
+
+- name: Check instance exists and is running
+  ansible.builtin.set_fact:
+    preflight_status: >-
+      {{
+        'skipped'
+        if (ec2_info.instances | length == 0
+            or ec2_info.instances[0].state.name != 'running')
+        else 'proceed'
+      }}
+    preflight_reason: >-
+      {{
+        'instance not found'
+        if (ec2_info.instances | length == 0)
+        else ('instance state: ' ~ ec2_info.instances[0].state.name)
+      }}
+
+- name: End play for non-running instances
+  ansible.builtin.meta: end_host
+  when: preflight_status == 'skipped'
+
+- name: Record instance metadata
+  ansible.builtin.set_fact:
+    ec2_instance_profile_arn: "{{ ec2_info.instances[0].iam_instance_profile.arn | default('') }}"
+    ec2_instance_profile_name: "{{ ec2_info.instances[0].iam_instance_profile.name | default('') }}"
+
+- name: Check if SSM knows about this instance (via AWS CLI)
+  ansible.builtin.command: >
+    aws ssm describe-instance-information
+    --filters "Key=InstanceIds,Values={{ inventory_hostname }}"
+    --region {{ aws_region }}
+    --profile {{ aws_profile }}
+    --query 'InstanceInformationList[0].InstanceId'
+    --output text
+  register: ssm_check
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  become: false
+
+- name: Set preflight status based on SSM registration
+  ansible.builtin.set_fact:
+    preflight_status: "{{ 'ready' if (ssm_check.rc == 0 and ssm_check.stdout | trim | length > 0) else 'no_ssm' }}"
+
+- name: End play if SSM is ready
+  ansible.builtin.meta: end_host
+  when: preflight_status == 'ready'
+
+# --- Bootstrap path: only if SSM is not registered and bootstrap=true ---
+
+- name: Report SSM not registered and bootstrap disabled
+  ansible.builtin.set_fact:
+    preflight_status: "skipped"
+    preflight_reason: "SSM agent not registered and bootstrap=false"
+  when: not bootstrap | bool
+
+- name: End play if bootstrap disabled
+  ansible.builtin.meta: end_host
+  when: not bootstrap | bool
+
+# --- Create IAM role + instance profile if needed ---
+
+- name: Create or reuse SSM IAM role
+  amazon.aws.iam_role:
+    name: "EC2-SSM-Patch-Role"
+    assume_role_policy_document: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {"Service": "ec2.amazonaws.com"},
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      }
+    description: "IAM role for EC2 SSM access (created by patch automation)"
+    managed_policies:
+      - arn: "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+  register: iam_role_result
+  delegate_to: localhost
+  become: false
+
+- name: Create or reuse IAM instance profile
+  amazon.aws.iam_instance_profile:
+    name: "EC2-SSM-Patch-Profile"
+    role: "EC2-SSM-Patch-Role"
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+  register: iam_profile_result
+  delegate_to: localhost
+  become: false
+
+- name: Attach IAM instance profile to EC2 instance (via AWS CLI)
+  ansible.builtin.command: >
+    aws ec2 associate-iam-instance-profile
+    --instance-id {{ inventory_hostname }}
+    --iam-instance-profile Name=EC2-SSM-Patch-Profile
+    --region {{ aws_region }}
+    --profile {{ aws_profile }}
+  register: _attach_result
+  changed_when: true
+  failed_when: >
+    _attach_result.rc != 0
+    and 'InvalidParameterException' not in (_attach_result.stderr | default(''))
+  delegate_to: localhost
+  become: false
+
+- name: Wait for SSM agent to register (up to 5 minutes)
+  ansible.builtin.command: >
+    aws ssm describe-instance-information
+    --filters "Key=InstanceIds,Values={{ inventory_hostname }}"
+    --region {{ aws_region }}
+    --profile {{ aws_profile }}
+    --query 'InstanceInformationList[0].InstanceId'
+    --output text
+  register: ssm_check_retry
+  changed_when: false
+  delegate_to: localhost
+  become: false
+  until: ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0
+  retries: 10
+  delay: 30
+
+- name: Set bootstrapped status
+  ansible.builtin.set_fact:
+    preflight_status: "bootstrapped"
+  when: ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0
+
+- name: Fail if SSM still not registered after bootstrap
+  ansible.builtin.set_fact:
+    preflight_status: "error"
+    preflight_reason: "SSM agent not registered after bootstrap"
+  when: not (ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0)
+
+- name: End play if bootstrap failed
+  ansible.builtin.meta: end_host
+  when: preflight_status == 'error'

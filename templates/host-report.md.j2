@@ -1,0 +1,107 @@
+# Patch Report: {{ host_report.host }}
+
+- **Date:** {{ host_report.date }}
+- **Account:** {{ host_report.account }}
+- **Instance ID:** {{ host_report.instance_id }}
+- **Status:** {{ host_report.status }}
+{% if host_report.skip_reason %}
+- **Skip Reason:** {{ host_report.skip_reason }}
+{% endif %}
+{% if host_report.snapshot_id %}
+- **Pre-patch Snapshot:** {{ host_report.snapshot_id }}
+{% endif %}
+
+## Pre-Upgrade Snapshot
+
+- **Kernel:** {{ host_report.pre_snapshot.kernel }}
+- **Running Services ({{ host_report.pre_snapshot.running_services | length }}):**
+{% for svc in host_report.pre_snapshot.running_services %}
+  - `{{ svc }}`
+{% endfor %}
+- **Enabled-but-stopped ({{ host_report.pre_snapshot.enabled_stopped | length }}):**
+{% for svc in host_report.pre_snapshot.enabled_stopped %}
+  - `{{ svc }}`
+{% endfor %}
+{% if host_report.pre_snapshot.docker %}
+- **Docker Containers ({{ host_report.pre_snapshot.docker | length }}):**
+{% for c in host_report.pre_snapshot.docker %}
+  - `{{ c.name }}` (image: `{{ c.image }}`)
+{% endfor %}
+{% endif %}
+
+## Upgraded Packages ({{ host_report.upgraded | length }})
+
+{% if host_report.upgraded %}
+| Package | Old Version | New Version |
+|---------|------------|-------------|
+{% for pkg in host_report.upgraded %}
+| {{ pkg.name }} | {{ pkg.old }} | {{ pkg.new }} |
+{% endfor %}
+{% else %}
+No packages were upgraded.
+{% endif %}
+
+## Reboot
+
+- **Rebooted:** {{ host_report.rebooted }}
+- **Kernel changed:** {{ host_report.kernel_changed }}
+  - Pre: `{{ host_report.pre_snapshot.kernel }}`
+  - Post: `{{ host_report.post_snapshot.kernel }}`
+
+## Post-Upgrade Snapshot
+
+- **Kernel:** {{ host_report.post_snapshot.kernel }}
+- **Running Services ({{ host_report.post_snapshot.running_services | length }}):**
+{% for svc in host_report.post_snapshot.running_services %}
+  - `{{ svc }}`
+{% endfor %}
+{% if host_report.post_snapshot.docker %}
+- **Docker Containers ({{ host_report.post_snapshot.docker | length }}):**
+{% for c in host_report.post_snapshot.docker %}
+  - `{{ c.name }}` (image: `{{ c.image }}`)
+{% endfor %}
+{% endif %}
+
+## Verification
+
+- **Verified:** {{ host_report.verified }}
+
+### Service Drift
+
+{% if host_report.service_drift.dropped %}
+**DROPPED services (were running, now not):**
+{% for svc in host_report.service_drift.dropped %}
+  - `{{ svc }}`
+{% endfor %}
+{% else %}
+No services were dropped.
+{% endif %}
+
+{% if host_report.service_drift.added %}
+**ADDED services (now running, were not):**
+{% for svc in host_report.service_drift.added %}
+  - `{{ svc }}`
+{% endfor %}
+{% else %}
+No services were added.
+{% endif %}
+
+### Docker Drift
+
+{% if host_report.docker_drift.dropped %}
+**DROPPED containers:**
+{% for c in host_report.docker_drift.dropped %}
+  - `{{ c }}`
+{% endfor %}
+{% else %}
+No containers were dropped.
+{% endif %}
+
+{% if host_report.docker_drift.added %}
+**ADDED containers:**
+{% for c in host_report.docker_drift.added %}
+  - `{{ c }}`
+{% endfor %}
+{% else %}
+No containers were added.
+{% endif %}

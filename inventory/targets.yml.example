@@ -1,0 +1,21 @@
+---
+# Per-run target list.
+# Copy to targets.yml and fill in the instance IDs for this patching cycle.
+# One group per account. Account IDs and role ARNs live in accounts.yml.
+#
+# Example:
+#
+# prod:
+#   hosts:
+#     i-0abc123def456:
+#     i-0def456abc789:
+# nonprod:
+#   hosts:
+#     i-0aaa111bbb222:
+#     i-0bbb222ccc333:
+
+prod:
+  hosts: {}
+
+nonprod:
+  hosts: {}

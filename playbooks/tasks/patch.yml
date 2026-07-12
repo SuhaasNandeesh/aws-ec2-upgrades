@@ -1,0 +1,196 @@
+---
+# playbooks/tasks/patch.yml
+# The upgrade phase. Runs apt update + apt dist-upgrade non-interactively.
+# Sets facts:
+#   - upgraded_packages: list[dict] with name, old, new
+#   - upgrade_failed: bool
+#   - upgrade_error: str (error message if failed)
+
+- name: Record pre-upgrade package versions
+  ansible.builtin.set_fact:
+    _pre_pkg_versions: "{{ pre_package_versions | default({}) }}"
+    upgrade_failed: false
+    upgrade_error: ""
+
+- name: Disable unattended-upgrades to avoid apt lock contention
+  ansible.builtin.systemd:
+    name: unattended-upgrades
+    state: stopped
+  failed_when: false
+
+- name: Run upgrade with disk check, apt upgrade, autoremove (block/rescue/always)
+  block:
+    - name: Check available disk space before upgrade
+      ansible.builtin.shell: |
+        set -o pipefail
+        boot_free=$(df -Pk /boot 2>/dev/null | awk 'NR==2 {print $4}')
+        root_free=$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')
+        echo "boot:${boot_free:-0} root:${root_free:-0}"
+      register: _disk_check
+      changed_when: false
+      failed_when: false
+
+    - name: Verify sufficient disk space (boot >= 500MB, root >= 1GB)
+      ansible.builtin.assert:
+        that:
+          - "{{ (_disk_check.stdout | regex_search('boot:(\\d+)', '\\1') | first | int) >= 512000 }}"
+          - "{{ (_disk_check.stdout | regex_search('root:(\\d+)', '\\1') | first | int) >= 1024000 }}"
+        fail_msg: >-
+          Insufficient disk space for upgrade.
+          boot: {{ (_disk_check.stdout | regex_search('boot:(\\d+)', '\\1') | first | int) // 1024 }}MB free,
+          root: {{ (_disk_check.stdout | regex_search('root:(\\d+)', '\\1') | first | int) // 1024 }}MB free.
+          Required: boot >= 500MB, root >= 1GB.
+
+    - name: apt-get update
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        force_apt_get: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: apt-get dist-upgrade (noninteractive)
+      ansible.builtin.apt:
+        upgrade: dist
+        dpkg_options: "force-confold,force-confdef"
+        force_apt_get: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+        NEEDRESTART_MODE: a
+
+    - name: Autoremove obsolete packages to free disk space
+      ansible.builtin.apt:
+        autoremove: true
+        purge: true
+        force_apt_get: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Read post-upgrade package versions
+      ansible.builtin.shell:
+        cmd: |
+          awk '/^Package:/ { pkg=$2 }
+               /^Status:/ { if ($3 != "installed") pkg="" }
+               /^Version:/ { if (pkg) print pkg "\t" $2; pkg="" }' /var/lib/dpkg/status
+      register: _post_pkg_raw
+      changed_when: false
+
+    - name: Compute upgraded packages (pre vs post version diff)
+      ansible.builtin.set_fact:
+        upgraded_packages: >-
+          {%
+            set post_map = {}
+          -%}
+          {%
+            for line in _post_pkg_raw.stdout_lines
+          -%}
+            {%
+              set parts = line.split('\t')
+            -%}
+            {%
+              if parts | length >= 2
+            -%}
+              {%
+                set _ = post_map.__setitem__(parts[0], parts[1])
+              -%}
+            {%
+              endif
+          -%}
+          {%
+            endfor
+          -%}
+          {%
+            set upgraded = []
+          -%}
+          {%
+            for name, old_ver in _pre_pkg_versions.items()
+          -%}
+            {%
+              set new_ver = post_map.get(name, old_ver)
+            -%}
+            {%
+              if new_ver != old_ver
+            -%}
+              {%
+                set _ = upgraded.append({'name': name, 'old': old_ver, 'new': new_ver})
+              -%}
+            {%
+              endif
+          -%}
+          {%
+            endfor
+          -%}
+          {{ upgraded | sort(attribute='name') }}
+
+  rescue:
+    - name: Mark upgrade as failed
+      ansible.builtin.set_fact:
+        upgrade_failed: true
+        upgrade_error: "{{ ansible_failed_result.msg | default('apt upgrade failed') }}"
+
+    - name: Read post-upgrade package versions (after failure)
+      ansible.builtin.shell:
+        cmd: |
+          awk '/^Package:/ { pkg=$2 }
+               /^Status:/ { if ($3 != "installed") pkg="" }
+               /^Version:/ { if (pkg) print pkg "\t" $2; pkg="" }' /var/lib/dpkg/status
+      register: _post_pkg_raw_rescue
+      changed_when: false
+      failed_when: false
+
+    - name: Compute upgraded packages (partial, if any)
+      ansible.builtin.set_fact:
+        upgraded_packages: >-
+          {%
+            set post_map = {}
+          -%}
+          {%
+            for line in _post_pkg_raw_rescue.stdout_lines
+          -%}
+            {%
+              set parts = line.split('\t')
+            -%}
+            {%
+              if parts | length >= 2
+            -%}
+              {%
+                set _ = post_map.__setitem__(parts[0], parts[1])
+              -%}
+            {%
+              endif
+          -%}
+          {%
+            endfor
+          -%}
+          {%
+            set upgraded = []
+          -%}
+          {%
+            for name, old_ver in _pre_pkg_versions.items()
+          -%}
+            {%
+              set new_ver = post_map.get(name, old_ver)
+            -%}
+            {%
+              if new_ver != old_ver
+            -%}
+              {%
+                set _ = upgraded.append({'name': name, 'old': old_ver, 'new': new_ver})
+              -%}
+            {%
+              endif
+          -%}
+          {%
+            endfor
+          -%}
+          {{ upgraded | sort(attribute='name') }}
+
+    - name: Force-end host after upgrade failure (rescue path)
+      ansible.builtin.meta: end_host
+
+  always:
+    - name: Re-enable unattended-upgrades
+      ansible.builtin.systemd:
+        name: unattended-upgrades
+        state: started
+      failed_when: false

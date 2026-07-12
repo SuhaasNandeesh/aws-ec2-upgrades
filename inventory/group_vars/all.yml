@@ -1,0 +1,23 @@
+---
+# inventory/group_vars/all.yml
+# Default vars applied to all hosts in both account groups.
+# Override per-group in inventory/group_vars/<group>.yml
+
+# SSM connection settings - used by community.aws.aws_ssm connection plugin
+ansible_connection: community.aws.aws_ssm
+ansible_python_interpreter: /usr/bin/python3
+
+# SSM command timeout and retries
+ansible_aws_ssm_timeout: 600
+ansible_aws_ssm_retries: 3
+
+# S3 bucket required by the SSM connection plugin for module file transfer.
+# Must exist in the same account as the target instances.
+# Override per group in inventory/group_vars/<group>.yml
+ssm_bucket_name: ""
+ansible_aws_ssm_bucket_name: "{{ ssm_bucket_name }}"
+
+# Default AWS region (override per account in group_vars)
+# ap-south-1 = Mumbai (Central India), eu-central-1 = Frankfurt
+aws_region: "ap-south-1"
+ansible_aws_ssm_region: "{{ aws_region }}"

@@ -1,0 +1,726 @@
+---
+# playbooks/patch.yml
+# Main orchestrator for EC2 patch automation.
+#
+# Phases per host:
+#   1. Preflight - check SSM readiness, optionally bootstrap IAM role
+#   2. Pre-snapshot - collect running services, enabled-stopped, docker, kernel, packages
+#   3. Snapshot root EBS volume (optional)
+#   4. Upgrade - apt update + apt dist-upgrade (noninteractive)
+#   5. Reboot - EC2 reboot via reboot-instances (preserves instance store, no data loss)
+#   6. Post-snapshot - collect same facts as pre, verify drift
+#   7. Render per-host reports for patched hosts
+#  7b. Render reports for skipped/error/failed hosts
+#  7c. Safety net - render generic error report for any host without one
+#   8. Render run-level summary
+#
+# Design: every phase uses block/rescue so failures are captured as facts
+# (phase_error) rather than Ansible host-failures. This ensures every host
+# reaches the report phases and gets a report file. ignore_unreachable: true
+# ensures SSM connection failures don't drop hosts from subsequent plays.
+#
+# Usage:
+#   ./run-patch.sh
+#   ./run-patch.sh --limit prod --bootstrap
+#
+# Required extra vars:
+#   - run_date (str): YYYY-MM-DD
+#   - report_dir (str): path under repo root
+#   - bootstrap (str/bool): whether to auto-attach SSM profiles
+#   - snapshot (str/bool): whether to take EBS snapshots
+
+# ---------------------------------------------------------------------------
+# Phase 1: Preflight - SSM readiness check + optional bootstrap
+# ---------------------------------------------------------------------------
+- name: Phase 1 - Preflight SSM readiness check
+  hosts: all
+  gather_facts: false
+  serial: 5
+  tasks:
+    - name: Determine account group from inventory groups
+      ansible.builtin.set_fact:
+        account_group: >-
+          {{
+            group_names | difference(['all']) | first
+            if (group_names | difference(['all']) | length > 0)
+            else 'unknown'
+          }}
+
+    - name: Initialize phase error tracking
+      ansible.builtin.set_fact:
+        phase_error: ""
+
+    - name: Run preflight (with error capture)
+      block:
+        - name: Include preflight tasks
+          ansible.builtin.include_tasks: tasks/preflight.yml
+
+      rescue:
+        - name: Record Phase 1 failure
+          ansible.builtin.set_fact:
+            phase_error: "Phase 1 failed: {{ ansible_failed_result.msg | default('Preflight check failed') }}"
+            preflight_status: "error"
+            preflight_reason: "{{ ansible_failed_result.msg | default('Preflight check failed') }}"
+
+    - name: Debug preflight result
+      ansible.builtin.debug:
+        msg: >-
+          [{{ inventory_hostname }}] preflight={{ preflight_status }}
+          {{ 'reason=' ~ preflight_reason if preflight_reason is defined else '' }}
+
+# ---------------------------------------------------------------------------
+# Phase 2: Pre-upgrade fact collection
+# ---------------------------------------------------------------------------
+- name: Phase 2 - Pre-upgrade snapshot
+  hosts: all
+  gather_facts: false
+  serial: 5
+  ignore_unreachable: true
+  tasks:
+    - name: Skip hosts that failed preflight
+      ansible.builtin.meta: end_host
+      when: preflight_status | default('skipped') not in ['ready', 'bootstrapped']
+
+    - name: Collect pre-upgrade facts (with error capture)
+      block:
+        - name: Collect pre-upgrade facts
+          ansible.builtin.include_tasks: tasks/collect_facts.yml
+          vars:
+            snapshot_phase: "pre"
+
+      rescue:
+        - name: Record Phase 2 failure
+          ansible.builtin.set_fact:
+            phase_error: "Phase 2 failed: {{ ansible_failed_result.msg | default('SSM connection or fact collection failed') }}"
+
+        - name: End host for this phase
+          ansible.builtin.meta: end_host
+
+# ---------------------------------------------------------------------------
+# Phase 3: EBS snapshot of root volume (optional)
+# ---------------------------------------------------------------------------
+- name: Phase 3 - EBS snapshot (optional)
+  hosts: all
+  gather_facts: false
+  serial: 5
+  ignore_unreachable: true
+  tasks:
+    - name: Skip if snapshot disabled or host not ready
+      ansible.builtin.meta: end_host
+      when: >
+        not snapshot | bool
+        or preflight_status | default('skipped') not in ['ready', 'bootstrapped']
+
+    - name: Create EBS snapshot (with error capture + retry)
+      block:
+        - name: Get instance info (block device mappings + root device name)
+          amazon.aws.ec2_instance_info:
+            instance_ids:
+              - "{{ inventory_hostname }}"
+            region: "{{ aws_region }}"
+            profile: "{{ aws_profile }}"
+          register: ec2_info_snap
+          delegate_to: localhost
+          become: false
+          retries: 3
+          delay: 10
+          until: ec2_info_snap is not failed
+
+        - name: Extract root volume ID using root_device_name
+          ansible.builtin.set_fact:
+            _root_volume_id: >-
+              {{
+                ec2_info_snap.instances[0].block_device_mappings
+                | selectattr('device_name', '==', ec2_info_snap.instances[0].root_device_name)
+                | map(attribute='ebs.volume_id')
+                | first
+              }}
+
+        - name: Create pre-patch EBS snapshot of root volume
+          amazon.aws.ec2_snapshot:
+            volume_id: "{{ _root_volume_id }}"
+            description: "pre-patch {{ run_date }} {{ inventory_hostname }}"
+            region: "{{ aws_region }}"
+            profile: "{{ aws_profile }}"
+            wait_timeout: "{{ snapshot_wait_timeout | default(1800) }}"
+            snapshot_tags:
+              Name: "pre-patch-{{ inventory_hostname }}-{{ run_date }}"
+              Purpose: ec2-patch-automation
+              InstanceId: "{{ inventory_hostname }}"
+              Date: "{{ run_date }}"
+          register: ebs_snapshot_result
+          delegate_to: localhost
+          become: false
+          retries: 3
+          delay: 10
+          until: ebs_snapshot_result is not failed
+
+        - name: Record snapshot ID
+          ansible.builtin.set_fact:
+            prepatch_snapshot_id: "{{ ebs_snapshot_result.snapshot_id }}"
+
+        - name: Debug snapshot created
+          ansible.builtin.debug:
+            msg: "[{{ inventory_hostname }}] snapshot={{ prepatch_snapshot_id }}"
+
+      rescue:
+        - name: Record Phase 3 failure
+          ansible.builtin.set_fact:
+            phase_error: "Phase 3 failed: {{ ansible_failed_result.msg | default('EBS snapshot creation failed') }}"
+
+        - name: End host for this phase
+          ansible.builtin.meta: end_host
+
+# ---------------------------------------------------------------------------
+# Phase 4: Upgrade packages
+# ---------------------------------------------------------------------------
+- name: Phase 4 - Upgrade packages
+  hosts: all
+  gather_facts: false
+  serial: 5
+  ignore_unreachable: true
+  tasks:
+    - name: Skip hosts that failed preflight or earlier phases
+      ansible.builtin.meta: end_host
+      when: >
+        preflight_status | default('skipped') not in ['ready', 'bootstrapped']
+        or phase_error | default('') | length > 0
+
+    - name: Run upgrade tasks
+      ansible.builtin.include_tasks: tasks/patch.yml
+
+# ---------------------------------------------------------------------------
+# Phase 5: Reboot instance
+# Uses aws ec2 reboot-instances (true OS reboot, NOT stop/start).
+# This preserves instance store (ephemeral) volumes — no data loss.
+# Then waits for SSM agent + Session Manager to be fully ready.
+# ---------------------------------------------------------------------------
+- name: Phase 5 - Reboot instance
+  hosts: all
+  gather_facts: false
+  serial: 5
+  ignore_unreachable: true
+  tasks:
+    - name: Skip hosts that failed preflight, upgrade, or earlier phases
+      ansible.builtin.meta: end_host
+      when: >
+        preflight_status | default('skipped') not in ['ready', 'bootstrapped']
+        or upgrade_failed | default(false) | bool
+        or phase_error | default('') | length > 0
+
+    - name: Reboot and reconnect (with error capture)
+      block:
+        - name: Reboot EC2 instance via reboot-instances (preserves instance store)
+          ansible.builtin.command: >
+            aws ec2 reboot-instances
+            --instance-ids {{ inventory_hostname }}
+            --region {{ aws_region }}
+            --profile {{ aws_profile }}
+          register: _reboot_result
+          changed_when: true
+          delegate_to: localhost
+          become: false
+          retries: 3
+          delay: 10
+          until: _reboot_result is not failed
+
+        - name: Wait for SSM agent to come back online
+          ansible.builtin.command: >
+            aws ssm describe-instance-information
+            --filters "Key=InstanceIds,Values={{ inventory_hostname }}"
+            --region {{ aws_region }}
+            --profile {{ aws_profile }}
+            --query 'InstanceInformationList[0].InstanceId'
+            --output text
+          register: _ssm_back
+          changed_when: false
+          delegate_to: localhost
+          become: false
+          until: _ssm_back.rc == 0 and _ssm_back.stdout | trim | length > 0
+          retries: 15
+          delay: 30
+
+        - name: Reset SSM connection (stale session after reboot)
+          ansible.builtin.meta: reset_connection
+
+        - name: Wait for SSM Session Manager to accept connections
+          ansible.builtin.wait_for_connection:
+            timeout: 300
+          retries: 3
+          delay: 10
+
+        - name: Mark rebooted
+          ansible.builtin.set_fact:
+            rebooted: true
+
+      rescue:
+        - name: Record Phase 5 failure
+          ansible.builtin.set_fact:
+            phase_error: "Phase 5 failed: {{ ansible_failed_result.msg | default('Reboot or SSM reconnection failed') }}"
+
+        - name: End host for this phase
+          ansible.builtin.meta: end_host
+
+# ---------------------------------------------------------------------------
+# Phase 6: Post-upgrade fact collection + verification
+# ---------------------------------------------------------------------------
+- name: Phase 6 - Post-upgrade snapshot and verify
+  hosts: all
+  gather_facts: false
+  serial: 5
+  ignore_unreachable: true
+  tasks:
+    - name: Skip hosts that failed preflight, upgrade, or earlier phases
+      ansible.builtin.meta: end_host
+      when: >
+        preflight_status | default('skipped') not in ['ready', 'bootstrapped']
+        or upgrade_failed | default(false) | bool
+        or phase_error | default('') | length > 0
+
+    - name: Collect post-upgrade facts and verify (with error capture)
+      block:
+        - name: Collect post-upgrade facts
+          ansible.builtin.include_tasks: tasks/collect_facts.yml
+          vars:
+            snapshot_phase: "post"
+
+        - name: Compute service drift
+          ansible.builtin.set_fact:
+            service_drift: "{{ pre_running_services | service_diff(post_running_services) }}"
+
+        - name: Compute docker drift
+          ansible.builtin.set_fact:
+            docker_drift: "{{ pre_docker_containers | docker_diff(post_docker_containers) }}"
+
+        - name: Compute kernel changed
+          ansible.builtin.set_fact:
+            kernel_changed: "{{ pre_kernel != post_kernel }}"
+
+        - name: Compute verification status
+          ansible.builtin.set_fact:
+            verified: "{{ (service_drift.dropped | length == 0) and (docker_drift.dropped | length == 0) }}"
+
+      rescue:
+        - name: Record Phase 6 failure
+          ansible.builtin.set_fact:
+            phase_error: "Phase 6 failed: {{ ansible_failed_result.msg | default('Post-upgrade fact collection or verification failed') }}"
+
+        - name: End host for this phase
+          ansible.builtin.meta: end_host
+
+# ---------------------------------------------------------------------------
+# Phase 7: Render per-host reports for patched hosts
+# A host gets a "patched" report only if it passed all phases with no errors.
+# ---------------------------------------------------------------------------
+- name: Phase 7 - Render per-host reports (patched hosts)
+  hosts: all
+  gather_facts: false
+  serial: 5
+  ignore_unreachable: true
+  tasks:
+    - name: Skip non-patched hosts (they get reports in Phase 7b)
+      ansible.builtin.meta: end_host
+      when: >
+        preflight_status | default('skipped') not in ['ready', 'bootstrapped']
+        or upgrade_failed | default(false) | bool
+        or phase_error | default('') | length > 0
+
+    - name: Determine account group
+      ansible.builtin.set_fact:
+        account_group: >-
+          {{
+            group_names | difference(['all']) | first
+            if (group_names | difference(['all']) | length > 0)
+            else 'unknown'
+          }}
+
+    - name: Build host report object
+      ansible.builtin.set_fact:
+        host_report:
+          date: "{{ run_date }}"
+          account: "{{ account_group }}"
+          host: "{{ inventory_hostname }}"
+          instance_id: "{{ inventory_hostname }}"
+          status: "patched"
+          skip_reason: ""
+          snapshot_id: "{{ prepatch_snapshot_id | default('') }}"
+          pre_snapshot:
+            running_services: "{{ pre_running_services | default([]) }}"
+            enabled_stopped: "{{ pre_enabled_stopped | default([]) }}"
+            docker: "{{ pre_docker_containers | default([]) }}"
+            kernel: "{{ pre_kernel | default('') }}"
+          upgraded: "{{ upgraded_packages | default([]) }}"
+          rebooted: "{{ rebooted | default(false) }}"
+          post_snapshot:
+            running_services: "{{ post_running_services | default([]) }}"
+            enabled_stopped: "{{ post_enabled_stopped | default([]) }}"
+            docker: "{{ post_docker_containers | default([]) }}"
+            kernel: "{{ post_kernel | default('') }}"
+          service_drift: "{{ service_drift | default({'dropped': [], 'added': []}) }}"
+          docker_drift: "{{ docker_drift | default({'dropped': [], 'added': []}) }}"
+          kernel_changed: "{{ kernel_changed | default(false) }}"
+          verified: "{{ verified | default(false) }}"
+
+    - name: Ensure per-account report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}/{{ account_group }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Render JSON report
+      ansible.builtin.template:
+        src: "../templates/host-report.json.j2"
+        dest: "{{ report_dir }}/{{ account_group }}/{{ inventory_hostname }}.json"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      ignore_errors: true
+
+    - name: Render Markdown report
+      ansible.builtin.template:
+        src: "../templates/host-report.md.j2"
+        dest: "{{ report_dir }}/{{ account_group }}/{{ inventory_hostname }}.md"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      ignore_errors: true
+
+    - name: Debug report path
+      ansible.builtin.debug:
+        msg: >-
+          [{{ inventory_hostname }}] reports written to
+          {{ report_dir }}/{{ account_group }}/{{ inventory_hostname }}.json + .md
+
+# ---------------------------------------------------------------------------
+# Phase 7b: Render reports for skipped/error/failed hosts
+# Any host that was NOT patched gets a report here. This covers:
+#   - Preflight skipped (not running, no SSM, bootstrap disabled)
+#   - Upgrade failed (apt error, disk space)
+#   - Phase 2/3/5/6 failure (SSM drop, snapshot error, reboot error)
+# ---------------------------------------------------------------------------
+- name: Phase 7b - Render reports for skipped/error/failed hosts
+  hosts: all
+  gather_facts: false
+  serial: 5
+  ignore_unreachable: true
+  tasks:
+    - name: Skip hosts that were patched (they got reports in Phase 7)
+      ansible.builtin.meta: end_host
+      when: >
+        preflight_status | default('skipped') in ['ready', 'bootstrapped']
+        and not upgrade_failed | default(false) | bool
+        and phase_error | default('') | length == 0
+
+    - name: Determine account group
+      ansible.builtin.set_fact:
+        account_group: >-
+          {{
+            group_names | difference(['all']) | first
+            if (group_names | difference(['all']) | length > 0)
+            else 'unknown'
+          }}
+
+    - name: Determine report status and reason
+      ansible.builtin.set_fact:
+        _report_status: >-
+          {{
+            'error' if phase_error | default('') | length > 0
+            else ('error' if upgrade_failed | default(false) | bool
+            else preflight_status | default('skipped'))
+          }}
+        _report_reason: >-
+          {{
+            phase_error | default('') if phase_error | default('') | length > 0
+            else (upgrade_error | default('') if upgrade_failed | default(false) | bool
+            else preflight_reason | default(''))
+          }}
+
+    - name: Build host report for skipped/error/failed host
+      ansible.builtin.set_fact:
+        host_report:
+          date: "{{ run_date }}"
+          account: "{{ account_group }}"
+          host: "{{ inventory_hostname }}"
+          instance_id: "{{ inventory_hostname }}"
+          status: "{{ _report_status }}"
+          skip_reason: "{{ _report_reason }}"
+          snapshot_id: "{{ prepatch_snapshot_id | default('') }}"
+          pre_snapshot:
+            running_services: "{{ pre_running_services | default([]) }}"
+            enabled_stopped: "{{ pre_enabled_stopped | default([]) }}"
+            docker: "{{ pre_docker_containers | default([]) }}"
+            kernel: "{{ pre_kernel | default('') }}"
+          upgraded: "{{ upgraded_packages | default([]) }}"
+          rebooted: false
+          post_snapshot:
+            running_services: []
+            enabled_stopped: []
+            docker: []
+            kernel: ""
+          service_drift:
+            dropped: []
+            added: []
+          docker_drift:
+            dropped: []
+            added: []
+          kernel_changed: false
+          verified: false
+
+    - name: Ensure per-account report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}/{{ account_group }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Render JSON report for skipped/error host
+      ansible.builtin.template:
+        src: "../templates/host-report.json.j2"
+        dest: "{{ report_dir }}/{{ account_group }}/{{ inventory_hostname }}.json"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      ignore_errors: true
+
+    - name: Render Markdown report for skipped/error host
+      ansible.builtin.template:
+        src: "../templates/host-report.md.j2"
+        dest: "{{ report_dir }}/{{ account_group }}/{{ inventory_hostname }}.md"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      ignore_errors: true
+
+    - name: Debug skipped/error host report
+      ansible.builtin.debug:
+        msg: >-
+          [{{ inventory_hostname }}] {{ _report_status }}
+          report written to {{ report_dir }}/{{ account_group }}/
+
+# ---------------------------------------------------------------------------
+# Phase 7c: Safety net - render generic error report for any host without one
+# This catches hosts that were unreachable (SSM down) and never processed
+# any phase, or hosts that failed during report rendering itself.
+# ---------------------------------------------------------------------------
+- name: Phase 7c - Safety net for missing reports
+  hosts: all
+  gather_facts: false
+  serial: 5
+  ignore_unreachable: true
+  tasks:
+    - name: Determine account group
+      ansible.builtin.set_fact:
+        account_group: >-
+          {{
+            group_names | difference(['all']) | first
+            if (group_names | difference(['all']) | length > 0)
+            else 'unknown'
+          }}
+
+    - name: Check if JSON report already exists for this host
+      ansible.builtin.stat:
+        path: "{{ report_dir }}/{{ account_group }}/{{ inventory_hostname }}.json"
+      register: _report_exists
+      delegate_to: localhost
+      become: false
+
+    - name: Skip host if report already exists
+      ansible.builtin.meta: end_host
+      when: _report_exists.stat.exists
+
+    - name: Build generic error report for missing host
+      ansible.builtin.set_fact:
+        host_report:
+          date: "{{ run_date }}"
+          account: "{{ account_group }}"
+          host: "{{ inventory_hostname }}"
+          instance_id: "{{ inventory_hostname }}"
+          status: "error"
+          skip_reason: >-
+            {{
+              'Host unreachable - SSM connection failed'
+              if phase_error is not defined
+              else (phase_error if phase_error | length > 0
+              else 'Unknown failure - no report was generated by earlier phases')
+            }}
+          snapshot_id: ""
+          pre_snapshot:
+            running_services: []
+            enabled_stopped: []
+            docker: []
+            kernel: ""
+          upgraded: []
+          rebooted: false
+          post_snapshot:
+            running_services: []
+            enabled_stopped: []
+            docker: []
+            kernel: ""
+          service_drift:
+            dropped: []
+            added: []
+          docker_drift:
+            dropped: []
+            added: []
+          kernel_changed: false
+          verified: false
+
+    - name: Ensure per-account report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}/{{ account_group }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Render JSON report for missing host
+      ansible.builtin.template:
+        src: "../templates/host-report.json.j2"
+        dest: "{{ report_dir }}/{{ account_group }}/{{ inventory_hostname }}.json"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Render Markdown report for missing host
+      ansible.builtin.template:
+        src: "../templates/host-report.md.j2"
+        dest: "{{ report_dir }}/{{ account_group }}/{{ inventory_hostname }}.md"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Debug missing host report
+      ansible.builtin.debug:
+        msg: >-
+          [{{ inventory_hostname }}] error (safety net)
+          report written to {{ report_dir }}/{{ account_group }}/
+
+# ---------------------------------------------------------------------------
+# Phase 8: Render run-level summary
+# ---------------------------------------------------------------------------
+- name: Phase 8 - Render run summary
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Find all JSON report files (excluding summary.json)
+      ansible.builtin.find:
+        paths: "{{ report_dir }}"
+        patterns: "*.json"
+        recurse: true
+        excludes:
+          - "summary.json"
+      register: _report_files
+
+    - name: Slurp all JSON reports
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: _report_blobs
+      loop: "{{ _report_files.files }}"
+
+    - name: Parse all reports (skip malformed)
+      ansible.builtin.set_fact:
+        _all_reports: >-
+          {%
+            set reports = []
+          -%}
+          {%
+            for blob in _report_blobs.results
+          -%}
+            {%
+              set _ = reports.append(blob.content | b64decode | from_json)
+            -%}
+          {%- endfor
+          -%}
+          {{ reports }}
+
+    - name: Build summary data structure
+      ansible.builtin.set_fact:
+        run_summary:
+          date: "{{ run_date }}"
+          accounts: "{{ _all_reports | map(attribute='account') | unique | list }}"
+          total_hosts: "{{ _all_reports | length }}"
+          hosts_patched: "{{ _all_reports | selectattr('status', '==', 'patched') | list | length }}"
+          hosts_skipped: "{{ _all_reports | selectattr('status', 'in', ['skipped', 'no_ssm']) | list | length }}"
+          hosts_errors: "{{ _all_reports | selectattr('status', '==', 'error') | list | length }}"
+          hosts_with_drift: "{{ _all_reports | selectattr('verified', '==', false) | rejectattr('status', 'in', ['skipped', 'no_ssm', 'error']) | list | length }}"
+          per_account: []
+          all_upgrades: []
+
+    - name: Build per-account breakdown
+      ansible.builtin.set_fact:
+        run_summary: >-
+          {{
+            run_summary | combine({
+              'per_account': [
+                {
+                  'account': acct,
+                  'total': _all_reports | selectattr('account', '==', acct) | list | length,
+                  'patched': _all_reports | selectattr('account', '==', acct) | selectattr('status', '==', 'patched') | list | length,
+                  'skipped': _all_reports | selectattr('account', '==', acct) | selectattr('status', 'in', ['skipped', 'no_ssm']) | list | length,
+                  'errors': _all_reports | selectattr('account', '==', acct) | selectattr('status', '==', 'error') | list | length,
+                  'total_upgrades': _all_reports
+                    | selectattr('account', '==', acct)
+                    | selectattr('status', '==', 'patched')
+                    | map(attribute='upgraded')
+                    | map('length')
+                    | sum(start=0),
+                  'skipped_hosts': _all_reports
+                    | selectattr('account', '==', acct)
+                    | selectattr('status', 'in', ['skipped', 'no_ssm', 'error'])
+                    | map(attribute='host')
+                    | list,
+                  'drift_hosts': _all_reports
+                    | selectattr('account', '==', acct)
+                    | selectattr('verified', '==', false)
+                    | rejectattr('status', 'in', ['skipped', 'no_ssm', 'error'])
+                    | map(attribute='host')
+                    | list
+                }
+                for acct in (_all_reports | map(attribute='account') | unique | list)
+              ]
+            })
+          }}
+
+    - name: Build all-upgrades list (aggregated across fleet)
+      ansible.builtin.set_fact:
+        run_summary: >-
+          {{
+            run_summary | combine({
+              'all_upgrades': (
+                _all_reports
+                | selectattr('status', '==', 'patched')
+                | map(attribute='upgraded')
+                | flatten
+              )
+            })
+          }}
+
+    - name: Render summary Markdown
+      ansible.builtin.template:
+        src: "../templates/summary.md.j2"
+        dest: "{{ report_dir }}/summary.md"
+        mode: "0644"
+      vars:
+        summary: "{{ run_summary }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Render summary JSON
+      ansible.builtin.copy:
+        content: "{{ run_summary | to_nice_json_safe }}"
+        dest: "{{ report_dir }}/summary.json"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Debug summary
+      ansible.builtin.debug:
+        msg: >-
+          Summary: {{ run_summary.total_hosts }} hosts targeted,
+          {{ run_summary.hosts_patched }} patched,
+          {{ run_summary.hosts_skipped }} skipped,
+          {{ run_summary.hosts_errors }} errors.
+          Summary at {{ report_dir }}/summary.md

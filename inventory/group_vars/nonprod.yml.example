@@ -1,0 +1,20 @@
+---
+# Per-group vars for the nonprod account group.
+# Copy to nonprod.yml and adjust.
+#
+# The profile name must match a profile in ~/.aws/config that assumes a role
+# into this account via source_profile + role_arn chaining.
+# Example ~/.aws/config:
+#   [profile nonprod]
+#   source_profile = default
+#   role_arn = arn:aws:iam::444455556666:role/ec2-patch-automation
+
+aws_profile: nonprod
+aws_region: "eu-central-1"
+
+# SSM connection plugin reads these (not the custom vars above)
+ansible_aws_ssm_profile: "{{ aws_profile }}"
+ansible_aws_ssm_region: "{{ aws_region }}"
+
+# S3 bucket in this account for SSM module file transfer
+ssm_bucket_name: ""  # e.g. "nonprod-ssm-patch-transfer"
