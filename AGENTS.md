@@ -85,6 +85,7 @@ ansible-playbook --syntax-check playbooks/patch.yml -i inventory/targets.yml \
 | `playbooks/tasks/preflight.yml` | SSM readiness + optional bootstrap |
 | `playbooks/tasks/collect_facts.yml` | Service/docker/kernel/package snapshot |
 | `playbooks/tasks/patch.yml` | apt upgrade logic (inspector-driven or full dist-upgrade) |
+| `playbooks/tasks/safety-net-report.yml` | Generates error reports for unreachable hosts (Phase 7c) |
 | `templates/*.j2` | Report templates |
 | `filter_plugins/diff_utils.py` | `service_diff`, `docker_diff`, `package_diff`, `to_nice_json_safe` |
 
@@ -94,12 +95,17 @@ ansible-playbook --syntax-check playbooks/patch.yml -i inventory/targets.yml \
 - **Inspector manifest format**: flat JSON mapping instance ID → list of package names. Example at `inspector/manifest.json.example`. Export from Inspector v2 (`aws inspector2 list-findings`) or Console CSV export, trim to this format. Hosts in `targets.yml` but not in the manifest are skipped with a "skipped" report.
 - **`only_upgrade: true`** in inspector mode — only upgrades packages that are already installed. If a manifest entry names a package not installed on the host, it is silently ignored (no install, no error).
 - **Default mode is full dist-upgrade** — if neither `--inspector-manifest` nor `--full-upgrade` is passed, the playbook runs `apt dist-upgrade` on all hosts (backward compatible). Pass `--inspector-manifest` to switch to targeted mode.
-- **`unattended-upgrades`** must be stopped during `apt upgrade` to avoid dpkg lock. Task handles this; re-enables after.
+- **`unattended-upgrades`** must be stopped during `apt upgrade` to avoid dpkg lock. Task handles this; re-enables in `always:` block. **Note**: `meta: end_host` in rescue blocks skips `always:` — the rescue path does NOT use `end_host`; instead, subsequent phases skip failed hosts via `upgrade_failed` fact checks.
 - **`NEEDRESTART_MODE=a`** is required — without it, `needrestart` prompts hang the apt run indefinitely.
 - **`ec2_snapshot` uses `snapshot_tags`** not `tags` — this is different from `ec2_instance` which uses `tags`.
 - **S3 bucket must exist** in each target account — without it, SSM module transfer fails. Set `ssm_bucket_name` in group_vars.
 - **Reports path**: `reports/<YYYY-MM-DD>/<account>/<instance-id>.{json,md}` plus `reports/<YYYY-MM-DD>/summary.{md,json}`. Created automatically by the playbook.
+- **Unreachable hosts get safety-net reports**: `ignore_unreachable: true` excludes hosts from subsequent per-host plays. Phase 7c runs on `localhost` and iterates all inventory hosts to generate error reports for any without one.
 - **Bootstrap IAM perms**: `--bootstrap` needs `iam:CreateRole/AttachRolePolicy/CreateInstanceProfile/AddRoleToInstanceProfile` + `ec2:AssociateIamInstanceProfile` on the laptop role. Run without `--bootstrap` for normal cycles.
+- **Bootstrap reboots the instance**: after attaching the IAM profile, the instance is rebooted to force the SSM agent to pick up new IAM credentials. The agent doesn't pick up credentials without a reboot or service restart.
+- **`managed_policies` format**: `amazon.aws.iam_role` expects a list of ARN strings, not dicts. Use `- "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"` not `- arn: "..."`.
+- **SSM `describe-instance-information` returns "None"**: AWS CLI `--query` returns the string `"None"` when no results, not an empty string. All SSM checks must test `stdout | trim != 'None'` in addition to `length > 0`.
+- **`dpkg-query` for package versions**: use `dpkg-query -W -f='${Package}\t${Version}\n'` (with single quotes around the format string). Do NOT use `awk` on `/var/lib/dpkg/status` — the SSM PTY eats `$2`/`$3` shell variables. Pre-upgrade versions are read in Phase 4 (not cached from Phase 2) because `set_fact` with `cacheable: true` does not persist across plays with the SSM connection.
 - **Collection versions**: `amazon.aws 11.4.0` and `community.aws 11.1.0` are what got installed. The `requirements.yml` specifies `>=8.0.0`.
 - **Region defaults**: `ap-south-1` (Mumbai) for prod, `eu-central-1` (Frankfurt) for nonprod. Override via group_vars or `--region` flag.
 - **`reboot-instances` is non-blocking**: `aws ec2 reboot-instances` returns immediately. The playbook polls SSM agent registration (15 retries x 30s) then uses `wait_for_connection` (300s timeout) to confirm Session Manager is ready before proceeding.

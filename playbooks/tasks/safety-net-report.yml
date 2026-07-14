@@ -1,0 +1,78 @@
+---
+# playbooks/tasks/safety-net-report.yml
+# Generates a generic error report for a host that has no report yet.
+# Called from Phase 7c with loop over _missing_hosts.
+#
+# Expects:
+#   - item: instance ID (hostname in inventory)
+#   - report_dir, run_date
+#   - groups (Ansible built-in)
+
+- name: Determine account group for missing host
+  ansible.builtin.set_fact:
+    _missing_account: >-
+      {{
+        (groups | dict2items | rejectattr('key', 'equalto', 'all') | selectattr('value', 'contains', item) | list | first).key
+        if (groups | dict2items | rejectattr('key', 'equalto', 'all') | selectattr('value', 'contains', item) | list | length > 0)
+        else 'unknown'
+      }}
+
+- name: Ensure per-account report directory exists
+  ansible.builtin.file:
+    path: "{{ report_dir }}/{{ _missing_account }}"
+    state: directory
+    mode: "0755"
+
+- name: Build generic error report for missing host
+  ansible.builtin.set_fact:
+    _missing_report:
+      date: "{{ run_date }}"
+      account: "{{ _missing_account }}"
+      host: "{{ item }}"
+      instance_id: "{{ item }}"
+      status: "error"
+      upgrade_mode: "full"
+      skip_reason: "Host unreachable - SSM connection failed or host excluded from earlier phases"
+      snapshot_id: ""
+      pre_snapshot:
+        running_services: []
+        enabled_stopped: []
+        docker: []
+        kernel: ""
+      upgraded: []
+      rebooted: false
+      post_snapshot:
+        running_services: []
+        enabled_stopped: []
+        docker: []
+        kernel: ""
+      service_drift:
+        dropped: []
+        added: []
+      docker_drift:
+        dropped: []
+        added: []
+      kernel_changed: false
+      verified: false
+
+- name: Render JSON report for missing host
+  ansible.builtin.template:
+    src: "../templates/host-report.json.j2"
+    dest: "{{ report_dir }}/{{ _missing_account }}/{{ item }}.json"
+    mode: "0644"
+  vars:
+    host_report: "{{ _missing_report }}"
+
+- name: Render Markdown report for missing host
+  ansible.builtin.template:
+    src: "../templates/host-report.md.j2"
+    dest: "{{ report_dir }}/{{ _missing_account }}/{{ item }}.md"
+    mode: "0644"
+  vars:
+    host_report: "{{ _missing_report }}"
+
+- name: Debug missing host report
+  ansible.builtin.debug:
+    msg: >-
+      [{{ item }}] error (safety net)
+      report written to {{ report_dir }}/{{ _missing_account }}/

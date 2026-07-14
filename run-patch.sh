@@ -64,7 +64,7 @@ if [[ "$GV_VALIDATED" == "false" ]]; then
 fi
 
 RUN_DATE="$(date +%Y-%m-%d)"
-REPORT_DIR="reports/${RUN_DATE}"
+REPORT_DIR="${SCRIPT_DIR}/reports/${RUN_DATE}"
 mkdir -p "$REPORT_DIR"
 
 echo "=== EC2 Patch Automation ==="
@@ -99,7 +99,7 @@ if [[ -n "$INSPECTOR_MANIFEST" ]]; then
     echo "ERROR: Inspector manifest file not found: $INSPECTOR_MANIFEST"
     exit 1
   fi
-  MANIFEST_VAR="-e inspector_manifest=${INSPECTOR_MANIFEST}"
+  MANIFEST_VAR="-e inspector_manifest=$(cd "$SCRIPT_DIR" && python3 -c "import os; print(os.path.abspath('$INSPECTOR_MANIFEST'))")"
 fi
 
 ansible-playbook playbooks/patch.yml \

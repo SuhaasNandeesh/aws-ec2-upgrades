@@ -67,7 +67,7 @@
 
 - name: Set preflight status based on SSM registration
   ansible.builtin.set_fact:
-    preflight_status: "{{ 'ready' if (ssm_check.rc == 0 and ssm_check.stdout | trim | length > 0) else 'no_ssm' }}"
+    preflight_status: "{{ 'ready' if (ssm_check.rc == 0 and ssm_check.stdout | trim | length > 0 and ssm_check.stdout | trim != 'None') else 'no_ssm' }}"
 
 - name: End play if SSM is ready
   ansible.builtin.meta: end_host
@@ -103,7 +103,7 @@
       }
     description: "IAM role for EC2 SSM access (created by patch automation)"
     managed_policies:
-      - arn: "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
     region: "{{ aws_region }}"
     profile: "{{ aws_profile }}"
   register: iam_role_result
@@ -135,7 +135,17 @@
   delegate_to: localhost
   become: false
 
-- name: Wait for SSM agent to register (up to 5 minutes)
+- name: Reboot instance to force SSM agent to pick up new IAM credentials
+  ansible.builtin.command: >
+    aws ec2 reboot-instances
+    --instance-ids {{ inventory_hostname }}
+    --region {{ aws_region }}
+    --profile {{ aws_profile }}
+  delegate_to: localhost
+  become: false
+  changed_when: true
+
+- name: Wait for SSM agent to register (up to 10 minutes)
   ansible.builtin.command: >
     aws ssm describe-instance-information
     --filters "Key=InstanceIds,Values={{ inventory_hostname }}"
@@ -147,20 +157,20 @@
   changed_when: false
   delegate_to: localhost
   become: false
-  until: ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0
-  retries: 10
+  until: ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0 and ssm_check_retry.stdout | trim != 'None'
+  retries: 20
   delay: 30
 
 - name: Set bootstrapped status
   ansible.builtin.set_fact:
     preflight_status: "bootstrapped"
-  when: ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0
+  when: ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0 and ssm_check_retry.stdout | trim != 'None'
 
 - name: Fail if SSM still not registered after bootstrap
   ansible.builtin.set_fact:
     preflight_status: "error"
     preflight_reason: "SSM agent not registered after bootstrap"
-  when: not (ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0)
+  when: not (ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0 and ssm_check_retry.stdout | trim != 'None')
 
 - name: End play if bootstrap failed
   ansible.builtin.meta: end_host

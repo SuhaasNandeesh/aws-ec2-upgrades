@@ -113,12 +113,8 @@
   register: _kernel_raw
   changed_when: false
 
-- name: Parse /var/lib/dpkg/status into package versions (lightweight)
-  ansible.builtin.shell:
-    cmd: |
-      awk '/^Package:/ { pkg=$2 }
-           /^Status:/ { if ($3 != "installed") pkg="" }
-           /^Version:/ { if (pkg) print pkg "\t" $2; pkg="" }' /var/lib/dpkg/status
+- name: Parse package versions via dpkg-query
+  ansible.builtin.shell: dpkg-query -W -f='${Package}\t${Version}\n'
   register: _pkg_raw
   changed_when: false
 

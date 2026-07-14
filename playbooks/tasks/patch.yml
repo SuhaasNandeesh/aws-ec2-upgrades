@@ -7,30 +7,70 @@
 #   - upgrade_error: str (error message if failed)
 
 - name: Record pre-upgrade package versions
+  ansible.builtin.shell: dpkg-query -W -f='${Package}\t${Version}\n'
+  register: _pre_pkg_raw
+  changed_when: false
+
+- name: Build pre-upgrade package version dict
   ansible.builtin.set_fact:
-    _pre_pkg_versions: "{{ pre_package_versions | default({}) }}"
+    _pre_pkg_versions: >-
+      {%
+        set pkgs = {}
+      -%}
+      {%
+        for line in _pre_pkg_raw.stdout_lines
+      -%}
+        {%
+          set parts = line.split('\t')
+        -%}
+        {%
+          if parts | length >= 2
+        -%}
+          {%
+            set _ = pkgs.__setitem__(parts[0], parts[1])
+          -%}
+        {%
+          endif
+      -%}
+      {%
+        endfor
+      -%}
+      {{ pkgs }}
     upgrade_failed: false
     upgrade_error: ""
 
 - name: Determine upgrade mode and initialize target package list
   ansible.builtin.set_fact:
-    upgrade_mode: "{{ 'full' if full_upgrade | default(false) | bool else 'inspector' }}"
+    upgrade_mode: >-
+      {{
+        'full'
+        if (full_upgrade | default(false) | bool
+            or not (inspector_manifest is defined and inspector_manifest | length > 0))
+        else 'inspector'
+      }}
     upgrade_skipped: false
     upgrade_skip_reason: ""
     target_packages: []
+    _effective_full_upgrade: >-
+      {{
+        true
+        if (full_upgrade | default(false) | bool
+            or not (inspector_manifest is defined and inspector_manifest | length > 0))
+        else false
+      }}
 
 - name: Load Inspector manifest (inspector mode only)
   ansible.builtin.set_fact:
     _inspector_manifest: "{{ lookup('file', inspector_manifest) | from_json }}"
   when:
-    - not full_upgrade | default(false) | bool
+    - not _effective_full_upgrade | bool
     - inspector_manifest is defined and inspector_manifest | length > 0
 
 - name: Extract target packages for this host from manifest
   ansible.builtin.set_fact:
     target_packages: "{{ _inspector_manifest.get(inventory_hostname, []) }}"
   when:
-    - not full_upgrade | default(false) | bool
+    - not _effective_full_upgrade | bool
     - _inspector_manifest is defined
 
 - name: Mark host as skipped if not in manifest (inspector mode)
@@ -43,7 +83,7 @@
         else 'Host not found in inspector manifest'
       }}
   when:
-    - not full_upgrade | default(false) | bool
+    - not _effective_full_upgrade | bool
     - target_packages | length == 0
 
 - name: End host if upgrade skipped (not in inspector manifest)
@@ -59,10 +99,10 @@
 - name: Run upgrade with disk check, apt upgrade, autoremove (block/rescue/always)
   block:
     - name: Check available disk space before upgrade
-      ansible.builtin.shell: |
-        set -o pipefail
-        boot_free=$(df -Pk /boot 2>/dev/null | awk 'NR==2 {print $4}')
-        root_free=$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')
+      ansible.builtin.shell: >
+        boot_free=$(df -Pk /boot 2>/dev/null | awk 'NR==2 {print $4}');
+        root_free=$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}');
+        if [ -z "$boot_free" ]; then boot_free="$root_free"; fi;
         echo "boot:${boot_free:-0} root:${root_free:-0}"
       register: _disk_check
       changed_when: false
@@ -71,12 +111,12 @@
     - name: Verify sufficient disk space (boot >= 500MB, root >= 1GB)
       ansible.builtin.assert:
         that:
-          - "{{ (_disk_check.stdout | regex_search('boot:(\\d+)', '\\1') | first | int) >= 512000 }}"
-          - "{{ (_disk_check.stdout | regex_search('root:(\\d+)', '\\1') | first | int) >= 1024000 }}"
+          - "(_disk_check.stdout | regex_findall('boot:(\\d+)') | first | int) >= 512000"
+          - "(_disk_check.stdout | regex_findall('root:(\\d+)') | first | int) >= 1024000"
         fail_msg: >-
           Insufficient disk space for upgrade.
-          boot: {{ (_disk_check.stdout | regex_search('boot:(\\d+)', '\\1') | first | int) // 1024 }}MB free,
-          root: {{ (_disk_check.stdout | regex_search('root:(\\d+)', '\\1') | first | int) // 1024 }}MB free.
+          boot: {{ _disk_check.stdout | regex_findall('boot:(\\d+)') | first | default('0') }}KB free,
+          root: {{ _disk_check.stdout | regex_findall('root:(\\d+)') | first | default('0') }}KB free.
           Required: boot >= 500MB, root >= 1GB.
 
     - name: apt-get update
@@ -95,7 +135,7 @@
       environment:
         DEBIAN_FRONTEND: noninteractive
         NEEDRESTART_MODE: a
-      when: full_upgrade | default(false) | bool
+      when: _effective_full_upgrade | bool
 
     - name: apt-get upgrade targeted packages (Inspector-driven, noninteractive)
       ansible.builtin.apt:
@@ -108,7 +148,7 @@
         DEBIAN_FRONTEND: noninteractive
         NEEDRESTART_MODE: a
       when:
-        - not full_upgrade | default(false) | bool
+        - not _effective_full_upgrade | bool
         - target_packages is defined and target_packages | length > 0
 
     - name: Autoremove obsolete packages to free disk space
@@ -120,11 +160,7 @@
         DEBIAN_FRONTEND: noninteractive
 
     - name: Read post-upgrade package versions
-      ansible.builtin.shell:
-        cmd: |
-          awk '/^Package:/ { pkg=$2 }
-               /^Status:/ { if ($3 != "installed") pkg="" }
-               /^Version:/ { if (pkg) print pkg "\t" $2; pkg="" }' /var/lib/dpkg/status
+      ansible.builtin.shell: dpkg-query -W -f='${Package}\t${Version}\n'
       register: _post_pkg_raw
       changed_when: false
 
@@ -182,11 +218,7 @@
         upgrade_error: "{{ ansible_failed_result.msg | default('apt upgrade failed') }}"
 
     - name: Read post-upgrade package versions (after failure)
-      ansible.builtin.shell:
-        cmd: |
-          awk '/^Package:/ { pkg=$2 }
-               /^Status:/ { if ($3 != "installed") pkg="" }
-               /^Version:/ { if (pkg) print pkg "\t" $2; pkg="" }' /var/lib/dpkg/status
+      ansible.builtin.shell: dpkg-query -W -f='${Package}\t${Version}\n'
       register: _post_pkg_raw_rescue
       changed_when: false
       failed_when: false
@@ -237,9 +269,6 @@
             endfor
           -%}
           {{ upgraded | sort(attribute='name') }}
-
-    - name: Force-end host after upgrade failure (rescue path)
-      ansible.builtin.meta: end_host
 
   always:
     - name: Re-enable unattended-upgrades
