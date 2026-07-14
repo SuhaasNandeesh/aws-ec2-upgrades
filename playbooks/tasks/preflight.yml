@@ -134,6 +134,7 @@
     and 'InvalidParameterException' not in (_attach_result.stderr | default(''))
   delegate_to: localhost
   become: false
+  when: not ansible_check_mode | bool
 
 - name: Reboot instance to force SSM agent to pick up new IAM credentials
   ansible.builtin.command: >
@@ -144,6 +145,7 @@
   delegate_to: localhost
   become: false
   changed_when: true
+  when: not ansible_check_mode | bool
 
 - name: Wait for SSM agent to register (up to 10 minutes)
   ansible.builtin.command: >
@@ -160,17 +162,28 @@
   until: ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0 and ssm_check_retry.stdout | trim != 'None'
   retries: 20
   delay: 30
+  when: not ansible_check_mode | bool
+
+- name: Mark as skipped in dry-run mode (cannot bootstrap without mutating)
+  ansible.builtin.set_fact:
+    preflight_status: "skipped"
+    preflight_reason: "Dry-run mode: bootstrap requires IAM profile attachment and reboot"
+  when: ansible_check_mode | bool
 
 - name: Set bootstrapped status
   ansible.builtin.set_fact:
     preflight_status: "bootstrapped"
-  when: ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0 and ssm_check_retry.stdout | trim != 'None'
+  when:
+    - not ansible_check_mode | bool
+    - ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0 and ssm_check_retry.stdout | trim != 'None'
 
 - name: Fail if SSM still not registered after bootstrap
   ansible.builtin.set_fact:
     preflight_status: "error"
     preflight_reason: "SSM agent not registered after bootstrap"
-  when: not (ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0 and ssm_check_retry.stdout | trim != 'None')
+  when:
+    - not ansible_check_mode | bool
+    - not (ssm_check_retry.rc == 0 and ssm_check_retry.stdout | trim | length > 0 and ssm_check_retry.stdout | trim != 'None')
 
 - name: End play if bootstrap failed
   ansible.builtin.meta: end_host

@@ -211,6 +211,10 @@
         or upgrade_skipped | default(false) | bool
         or phase_error | default('') | length > 0
 
+    - name: Skip reboot in dry-run mode
+      ansible.builtin.meta: end_host
+      when: ansible_check_mode | bool
+
     - name: Reboot and reconnect (with error capture)
       block:
         - name: Reboot EC2 instance via reboot-instances (preserves instance store)
