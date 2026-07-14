@@ -4,6 +4,10 @@
 
 Ansible-based EC2 patch automation for Ubuntu/Debian instances across 2 AWS accounts. Runs from a laptop with SSM as the transport (no SSH). Takes pre-patch EBS snapshots, runs `apt upgrade`, reboots, verifies service state matches pre-patch, writes reports.
 
+Supports two upgrade modes:
+- **Inspector-driven (default)**: upgrades only the packages listed per-instance in an Inspector v2 manifest JSON. Hosts not in the manifest are skipped with a report.
+- **Full upgrade (fallback)**: upgrades all packages via `apt dist-upgrade`. Use `--full-upgrade` flag.
+
 ## Quick start (verified commands)
 
 ```bash
@@ -27,6 +31,12 @@ AWS_PROFILE=your-profile ./run-patch.sh --region eu-central-1
 
 # Dry run (Ansible check mode, no changes)
 AWS_PROFILE=your-profile ./run-patch.sh --dry-run
+
+# Inspector-driven targeted upgrade (only manifest-listed packages per host)
+AWS_PROFILE=your-profile ./run-patch.sh --inspector-manifest inspector/manifest.json
+
+# Full dist-upgrade fallback (ignores manifest, upgrades everything)
+AWS_PROFILE=your-profile ./run-patch.sh --full-upgrade
 ```
 
 ## Syntax check (verified)
@@ -38,11 +48,11 @@ ansible-playbook --syntax-check playbooks/patch.yml -i inventory/targets.yml \
 
 ## Architecture
 
-- `run-patch.sh` → `ansible-playbook playbooks/patch.yml` with vars: `run_date`, `report_dir`, `bootstrap`, `snapshot`
+- `run-patch.sh` → `ansible-playbook playbooks/patch.yml` with vars: `run_date`, `report_dir`, `bootstrap`, `snapshot`, `full_upgrade`, `inspector_manifest`
 - `playbooks/patch.yml` — 9-play orchestrator (preflight → pre-snapshot → EBS snapshot → upgrade → reboot → post-snapshot+verify → reports patched → reports skipped → summary). `serial: 5`.
 - `playbooks/tasks/preflight.yml` — checks `ec2_instance_info` + `aws ssm describe-instance-information` via CLI. If SSM not registered and `bootstrap=true`: creates `EC2-SSM-Patch-Role` + `EC2-SSM-Patch-Profile` via `amazon.aws.iam_role`/`iam_instance_profile`, attaches via `aws ec2 associate-iam-instance-profile` CLI.
 - `playbooks/tasks/collect_facts.yml` — called with `snapshot_phase: pre|post`. Collects `service_facts`, enabled-stopped systemd units, docker containers, kernel, dpkg package versions.
-- `playbooks/tasks/patch.yml` — stops `unattended-upgrades`, checks disk space (boot >= 500MB, root >= 1GB), runs `apt update` + `apt dist-upgrade` (noninteractive: `DEBIAN_FRONTEND=noninteractive`, `dpkg_options: force-confold,force-confdef`, `NEEDRESTART_MODE=a`, `force_apt_get: true`), diffs package versions. Uses `block/rescue/always` to ensure `unattended-upgrades` is re-enabled even on failure. Sets `upgrade_failed` + `upgrade_error` facts on failure.
+- `playbooks/tasks/patch.yml` — stops `unattended-upgrades`, checks disk space (boot >= 500MB, root >= 1GB), loads Inspector manifest if provided, runs `apt update` + either `apt dist-upgrade` (full mode) or `apt upgrade <target_packages>` (inspector mode, with `only_upgrade: true` so only already-installed packages are touched), diffs package versions. Uses `block/rescue/always` to ensure `unattended-upgrades` is re-enabled even on failure. Sets `upgrade_failed` + `upgrade_error` facts on failure. Sets `upgrade_skipped` + `upgrade_skip_reason` if host not in manifest (inspector mode). Sets `upgrade_mode` fact (`full` or `inspector`).
 - `filter_plugins/diff_utils.py` — custom filters: `service_diff`, `docker_diff`, `package_diff`, `to_nice_json_safe`.
 - `templates/` — `host-report.json.j2`, `host-report.md.j2`, `summary.md.j2`.
 
@@ -70,16 +80,20 @@ ansible-playbook --syntax-check playbooks/patch.yml -i inventory/targets.yml \
 | `inventory/group_vars/all.yml` | SSM connection config, `ansible_python_interpreter=/usr/bin/python3`, S3 bucket var, region default |
 | `inventory/group_vars/prod.yml.example` | `aws_profile`, `aws_region`, `ssm_bucket_name` for prod account |
 | `inventory/group_vars/nonprod.yml.example` | Same for nonprod |
+| `inspector/manifest.json.example` | Inspector v2 manifest (instance ID → package list). Copy to `inspector/manifest.json`. |
 | `playbooks/patch.yml` | Main playbook (9 phases) |
 | `playbooks/tasks/preflight.yml` | SSM readiness + optional bootstrap |
 | `playbooks/tasks/collect_facts.yml` | Service/docker/kernel/package snapshot |
-| `playbooks/tasks/patch.yml` | apt upgrade logic |
+| `playbooks/tasks/patch.yml` | apt upgrade logic (inspector-driven or full dist-upgrade) |
 | `templates/*.j2` | Report templates |
 | `filter_plugins/diff_utils.py` | `service_diff`, `docker_diff`, `package_diff`, `to_nice_json_safe` |
 
 ## Gotchas
 
 - **`.yml.example` files are not valid inventory** — syntax-check against them will warn. Copy to `.yml` first.
+- **Inspector manifest format**: flat JSON mapping instance ID → list of package names. Example at `inspector/manifest.json.example`. Export from Inspector v2 (`aws inspector2 list-findings`) or Console CSV export, trim to this format. Hosts in `targets.yml` but not in the manifest are skipped with a "skipped" report.
+- **`only_upgrade: true`** in inspector mode — only upgrades packages that are already installed. If a manifest entry names a package not installed on the host, it is silently ignored (no install, no error).
+- **Default mode is full dist-upgrade** — if neither `--inspector-manifest` nor `--full-upgrade` is passed, the playbook runs `apt dist-upgrade` on all hosts (backward compatible). Pass `--inspector-manifest` to switch to targeted mode.
 - **`unattended-upgrades`** must be stopped during `apt upgrade` to avoid dpkg lock. Task handles this; re-enables after.
 - **`NEEDRESTART_MODE=a`** is required — without it, `needrestart` prompts hang the apt run indefinitely.
 - **`ec2_snapshot` uses `snapshot_tags`** not `tags` — this is different from `ec2_instance` which uses `tags`.

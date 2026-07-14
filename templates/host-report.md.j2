@@ -4,6 +4,7 @@
 - **Account:** {{ host_report.account }}
 - **Instance ID:** {{ host_report.instance_id }}
 - **Status:** {{ host_report.status }}
+- **Upgrade Mode:** {{ host_report.upgrade_mode | default('full') }}
 {% if host_report.skip_reason %}
 - **Skip Reason:** {{ host_report.skip_reason }}
 {% endif %}

@@ -10,6 +10,8 @@ set -euo pipefail
 #   ./run-patch.sh --dry-run                # Ansible check mode (no changes)
 #   ./run-patch.sh --region eu-central-1    # override region for all groups
 #   ./run-patch.sh -e key=value             # pass extra vars to ansible-playbook
+#   ./run-patch.sh --inspector-manifest inspector/manifest.json  # targeted upgrade from Inspector v2 findings
+#   ./run-patch.sh --full-upgrade           # fallback: full dist-upgrade (ignores manifest)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -21,16 +23,20 @@ CHECK=""
 LIMIT=""
 REGION=""
 EXTRA_VARS=""
+INSPECTOR_MANIFEST=""
+FULL_UPGRADE="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bootstrap)    BOOTSTRAP="true"; shift ;;
-    --no-snapshot)  SNAPSHOT="false"; shift ;;
-    --check)        CHECK="--check"; shift ;;
-    --dry-run)      CHECK="--check"; shift ;;
-    --limit)        LIMIT="--limit $2"; shift 2 ;;
-    --region)       REGION="$2"; shift 2 ;;
-    -e)             EXTRA_VARS="$EXTRA_VARS -e $2"; shift 2 ;;
+    --bootstrap)          BOOTSTRAP="true"; shift ;;
+    --no-snapshot)        SNAPSHOT="false"; shift ;;
+    --check)              CHECK="--check"; shift ;;
+    --dry-run)            CHECK="--check"; shift ;;
+    --limit)              LIMIT="--limit $2"; shift 2 ;;
+    --region)             REGION="$2"; shift 2 ;;
+    -e)                   EXTRA_VARS="$EXTRA_VARS -e $2"; shift 2 ;;
+    --inspector-manifest) INSPECTOR_MANIFEST="$2"; shift 2 ;;
+    --full-upgrade)       FULL_UPGRADE="true"; shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -69,6 +75,13 @@ echo "Snapshot:  $SNAPSHOT"
 if [[ -n "$REGION" ]]; then
   echo "Region:    $REGION (override)"
 fi
+if [[ -n "$INSPECTOR_MANIFEST" ]]; then
+  echo "Manifest:  $INSPECTOR_MANIFEST (Inspector-targeted upgrade)"
+elif [[ "$FULL_UPGRADE" == "true" ]]; then
+  echo "Mode:      full dist-upgrade"
+else
+  echo "Mode:      full dist-upgrade (default; no manifest provided)"
+fi
 echo "Reports:   $REPORT_DIR"
 echo "================================"
 
@@ -80,13 +93,24 @@ if [[ -n "$REGION" ]]; then
   REGION_VAR="-e aws_region=${REGION}"
 fi
 
+MANIFEST_VAR=""
+if [[ -n "$INSPECTOR_MANIFEST" ]]; then
+  if [[ ! -f "$INSPECTOR_MANIFEST" ]]; then
+    echo "ERROR: Inspector manifest file not found: $INSPECTOR_MANIFEST"
+    exit 1
+  fi
+  MANIFEST_VAR="-e inspector_manifest=${INSPECTOR_MANIFEST}"
+fi
+
 ansible-playbook playbooks/patch.yml \
   -i inventory/targets.yml \
   -e "run_date=${RUN_DATE}" \
   -e "report_dir=${REPORT_DIR}" \
   -e "bootstrap=${BOOTSTRAP}" \
   -e "snapshot=${SNAPSHOT}" \
+  -e "full_upgrade=${FULL_UPGRADE}" \
   ${REGION_VAR} \
+  ${MANIFEST_VAR} \
   ${LIMIT} ${CHECK} ${EXTRA_VARS}
 
 echo ""

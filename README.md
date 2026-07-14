@@ -10,7 +10,9 @@ Automated OS patching for EC2 instances across multiple AWS accounts using Ansib
 4. Takes a pre-patch EBS snapshot of the root volume (auto-detects root device)
 5. Collects pre-upgrade state: running services, enabled-stopped services, docker containers, kernel, package versions
 6. Checks disk space (boot >= 500 MB, root >= 1 GB) — aborts cleanly if insufficient
-7. Runs `apt-get update` + `apt-get dist-upgrade` non-interactively, then `apt autoremove --purge`
+7. Runs `apt-get update` + upgrades packages (non-interactively), then `apt autoremove --purge`
+   - **Inspector-driven mode** (`--inspector-manifest`): upgrades only the packages listed per-instance in the manifest JSON. Hosts not in the manifest are skipped with a report.
+   - **Full upgrade mode** (`--full-upgrade` or no flags): runs `apt-get dist-upgrade` on all hosts.
 8. Reboots the instance via `aws ec2 reboot-instances` (true OS reboot — preserves instance store volumes, no data loss)
 9. Waits for SSM agent + Session Manager to come back online
 10. Collects post-upgrade state and diffs against pre-upgrade: flags any dropped services or containers
@@ -216,14 +218,32 @@ ansible-galaxy collection install -r requirements.yml
 
 This installs `amazon.aws >= 8.0` and `community.aws >= 8.0` (verified working with `amazon.aws 11.4.0` and `community.aws 11.1.0`).
 
-### Step 6. Verify setup
+### Step 6. (Optional) Prepare the Inspector manifest
+
+If you want Inspector-driven targeted patching (only specific packages per host):
+
+```bash
+cp inspector/manifest.json.example inspector/manifest.json
+```
+
+Fill in instance IDs and the packages to upgrade per host. See [`inspector/README.md`](inspector/README.md) for the format and how to derive it from an Inspector v2 export.
+
+```bash
+# Validate the JSON before running
+python3 -c "import json; json.load(open('inspector/manifest.json')); print('OK')"
+```
+
+Skip this step if you are running full dist-upgrade (`--full-upgrade` or no flags).
+
+### Step 7. Verify setup
 
 ```bash
 # Syntax check (no AWS calls, no changes)
 ansible-playbook --syntax-check playbooks/patch.yml \
   -i inventory/targets.yml \
   -e run_date=2026-01-01 -e report_dir=/tmp/reports \
-  -e bootstrap=false -e snapshot=true
+  -e bootstrap=false -e snapshot=true \
+  -e full_upgrade=false -e inspector_manifest=inspector/manifest.json
 
 # Validate run-patch.sh catches missing config
 ./run-patch.sh  # should print clear errors if targets.yml or group_vars are missing
@@ -234,8 +254,14 @@ ansible-playbook --syntax-check playbooks/patch.yml \
 ## Usage
 
 ```bash
-# Standard patch run (all hosts in targets.yml)
+# Standard patch run (full dist-upgrade, all hosts in targets.yml)
 AWS_PROFILE=your-profile ./run-patch.sh
+
+# Inspector-driven targeted upgrade (only manifest-listed packages per host)
+AWS_PROFILE=your-profile ./run-patch.sh --inspector-manifest inspector/manifest.json
+
+# Full dist-upgrade (ignores manifest, upgrades everything)
+AWS_PROFILE=your-profile ./run-patch.sh --full-upgrade
 
 # Patch only prod group
 AWS_PROFILE=your-profile ./run-patch.sh --limit prod
@@ -256,13 +282,28 @@ AWS_PROFILE=your-profile ./run-patch.sh --region eu-central-1
 AWS_PROFILE=your-profile ./run-patch.sh -e key=value
 
 # Combine flags
-AWS_PROFILE=your-profile ./run-patch.sh --limit prod --bootstrap --no-snapshot
+AWS_PROFILE=your-profile ./run-patch.sh --limit prod --inspector-manifest inspector/manifest.json --no-snapshot
 ```
+
+### Upgrade modes
+
+The playbook supports two upgrade modes:
+
+| Mode | Flag | What it does |
+|------|------|-------------|
+| **Inspector-driven** | `--inspector-manifest inspector/manifest.json` | Upgrades only the packages listed per-instance in the manifest JSON. Hosts in `targets.yml` but not in the manifest are skipped with a report. Uses `only_upgrade: true` so only already-installed packages are touched. |
+| **Full upgrade** | `--full-upgrade` (or no flags) | Runs `apt-get dist-upgrade` on all hosts. Backward compatible with previous behavior. |
+
+If neither `--inspector-manifest` nor `--full-upgrade` is passed, the playbook defaults to full dist-upgrade.
+
+See [`inspector/README.md`](inspector/README.md) for the manifest format and how to create it from an Inspector v2 export.
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
+| `--inspector-manifest <path>` | Inspector-driven targeted upgrade. Path to manifest JSON (instance ID → package list). |
+| `--full-upgrade` | Full dist-upgrade on all hosts. Ignores any manifest. |
 | `--limit <group>` | Patch only the specified group (e.g. `prod`, `nonprod`) |
 | `--bootstrap` | Auto-create `EC2-SSM-Patch-Role` + `EC2-SSM-Patch-Profile` and attach to unready instances. Needs extra IAM perms. |
 | `--no-snapshot` | Skip pre-patch EBS snapshots |
@@ -278,6 +319,8 @@ AWS_PROFILE=your-profile ./run-patch.sh --limit prod --bootstrap --no-snapshot
 | `aws_region` | `ap-south-1` | group_vars | AWS region for this account |
 | `ssm_bucket_name` | `""` (required) | group_vars | S3 bucket for SSM file transfer |
 | `snapshot_wait_timeout` | `1800` (30 min) | group_vars or `-e` | Max seconds to wait for EBS snapshot to complete |
+| `full_upgrade` | `false` | `--full-upgrade` flag | If `true`, runs `apt dist-upgrade` on all hosts (ignores manifest) |
+| `inspector_manifest` | `""` | `--inspector-manifest` flag | Path to Inspector manifest JSON for targeted per-host upgrades |
 
 ---
 
@@ -304,6 +347,7 @@ reports/2026-07-12/
 Each per-host report (`.json` + `.md`) contains:
 
 - **Status**: `patched`, `skipped`, `no_ssm`, or `error`
+- **Upgrade mode**: `inspector` or `full` — which mode was active for this host
 - **Skip reason**: empty for patched hosts; error message or skip reason for others
 - **Snapshot ID**: EBS snapshot ID if taken
 - **Pre-upgrade snapshot**: running services, enabled-stopped services, docker containers, kernel
@@ -332,7 +376,7 @@ run-patch.sh
         ├── Phase 1:  Preflight      — SSM readiness + optional bootstrap (block/rescue)
         ├── Phase 2:  Pre-snapshot    — collect services, docker, kernel, packages (block/rescue)
         ├── Phase 3:  EBS snapshot   — auto-detect root device, create snapshot (block/rescue, retry)
-        ├── Phase 4:  Upgrade         — disk check + apt dist-upgrade + autoremove (block/rescue/always)
+        ├── Phase 4:  Upgrade         — disk check + apt upgrade (inspector-targeted or full dist-upgrade) + autoremove (block/rescue/always)
         ├── Phase 5:  Reboot          — reboot-instances (preserves instance store) + SSM reconnect (block/rescue)
         ├── Phase 6:  Post-snapshot   — collect post-upgrade facts + drift verification (block/rescue)
         ├── Phase 7:  Reports         — per-host .json + .md for patched hosts
@@ -365,9 +409,13 @@ Uses `aws ec2 reboot-instances` — a true OS reboot. This is NOT `ec2_instance:
 
 1. Stops `unattended-upgrades` to avoid apt lock contention
 2. Checks disk space (boot >= 500 MB, root >= 1 GB) — aborts with clear message if insufficient
-3. Runs `apt-get update` + `apt-get dist-upgrade` with `DEBIAN_FRONTEND=noninteractive`, `force-confold`, `force-confdef`, `NEEDRESTART_MODE=a`, `force_apt_get: true`
-4. Runs `apt autoremove --purge` to clean up obsolete packages
-5. Re-enables `unattended-upgrades` in the `always` block — runs even if upgrade fails
+3. Runs `apt-get update` to refresh the package cache
+4. Upgrades packages in one of two modes:
+   - **Inspector-driven** (`--inspector-manifest`): runs `apt-get upgrade <target_packages>` with `only_upgrade: true` — only upgrades already-installed packages listed in the manifest for this host. Hosts not in the manifest are skipped before this step.
+   - **Full upgrade** (`--full-upgrade` or default): runs `apt-get dist-upgrade` to upgrade all packages.
+5. Both modes use `DEBIAN_FRONTEND=noninteractive`, `force-confold`, `force-confdef`, `NEEDRESTART_MODE=a`, `force_apt_get: true`
+6. Runs `apt autoremove --purge` to clean up obsolete packages
+7. Re-enables `unattended-upgrades` in the `always` block — runs even if upgrade fails
 
 ### Connection: SSM only, no SSH
 
@@ -388,10 +436,12 @@ Uses `aws ec2 reboot-instances` — a true OS reboot. This is NOT `ec2_instance:
 | `inventory/group_vars/all.yml` | SSM connection config, defaults (applies to all hosts) |
 | `inventory/group_vars/prod.yml.example` | Prod account vars template (copy to `prod.yml`) |
 | `inventory/group_vars/nonprod.yml.example` | Nonprod account vars template (copy to `nonprod.yml`) |
+| `inspector/manifest.json.example` | Inspector v2 manifest template (instance ID → package list). Copy to `manifest.json`. |
+| `inspector/README.md` | Inspector manifest format documentation and export instructions |
 | `playbooks/patch.yml` | Main playbook (10 phases: 1-8 + 7b + 7c) |
 | `playbooks/tasks/preflight.yml` | SSM readiness check + optional IAM bootstrap |
 | `playbooks/tasks/collect_facts.yml` | Service/docker/kernel/package collection (pre and post) |
-| `playbooks/tasks/patch.yml` | apt dist-upgrade logic with disk check, autoremove, block/rescue/always |
+| `playbooks/tasks/patch.yml` | apt upgrade logic (inspector-targeted or full dist-upgrade) with disk check, autoremove, block/rescue/always |
 | `templates/host-report.json.j2` | Per-host JSON report template |
 | `templates/host-report.md.j2` | Per-host Markdown report template |
 | `templates/summary.md.j2` | Run summary Markdown template |
@@ -403,6 +453,8 @@ Uses `aws ec2 reboot-instances` — a true OS reboot. This is NOT `ec2_instance:
 
 - **Serial=5**: hosts are processed in batches of 5 to avoid overwhelming SSM or the AWS API.
 - **dist-upgrade**: uses `apt-get dist-upgrade` (not `safe-upgrade`) to install new kernel images and handle dependency changes required for security patches.
+- **Inspector-driven mode**: when `--inspector-manifest` is provided, the playbook runs `apt-get upgrade <packages>` with `only_upgrade: true` — only already-installed packages listed in the manifest are touched. If a manifest entry names a package not installed on the host, it is silently ignored (no install, no error). Hosts in `targets.yml` but not in the manifest are skipped with a "Host not found in inspector manifest" report.
+- **Default mode**: if neither `--inspector-manifest` nor `--full-upgrade` is passed, the playbook runs `apt dist-upgrade` on all hosts (backward compatible with previous behavior).
 - **Non-interactive apt**: uses `DEBIAN_FRONTEND=noninteractive`, `force-confold`, `force-confdef`, `NEEDRESTART_MODE=a`, `force_apt_get: true` to prevent hangs.
 - **unattended-upgrades**: stopped before upgrade to avoid apt lock contention, re-enabled in `always` block (runs even on failure).
 - **Reboot**: uses `aws ec2 reboot-instances` (true OS reboot, preserves instance store volumes — no data loss). NOT `ec2_instance: state=restarted` (which does stop/start).
@@ -504,3 +556,22 @@ This means the host was never reachable via SSM from Phase 1. Check:
 2. Is SSM agent registered? `aws ssm describe-instance-information --filters Key=InstanceIds,Values=i-xxx --profile prod`
 3. Does the instance have an IAM profile with SSM permissions?
 4. Does the instance have network access to SSM endpoints?
+
+### Host shows as "skipped" with "Host not found in inspector manifest"
+
+This means the host was in `targets.yml` but not in the Inspector manifest. To fix:
+1. Check if the host should have been in the manifest — review Inspector v2 findings for this instance
+2. Add the instance ID and its vulnerable packages to `inspector/manifest.json`
+3. Validate the JSON: `python3 -c "import json; json.load(open('inspector/manifest.json')); print('OK')"`
+4. Re-run: `AWS_PROFILE=your-profile ./run-patch.sh --inspector-manifest inspector/manifest.json`
+
+If the host should get a full upgrade instead, run with `--full-upgrade` or without `--inspector-manifest`.
+
+### Inspector manifest JSON is invalid
+
+If the playbook fails with a JSON parse error on the manifest:
+
+1. Validate the JSON syntax: `python3 -c "import json; json.load(open('inspector/manifest.json')); print('OK')"`
+2. Check for trailing commas, unquoted keys, or missing braces
+3. Ensure instance IDs are quoted strings (e.g. `"i-0123456789abcdef0"`, not `i-0123456789abcdef0`)
+4. Ensure package names are quoted strings in a list (e.g. `["openssl", "libssl3"]`, not `[openssl, libssl3]`)

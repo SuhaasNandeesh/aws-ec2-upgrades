@@ -4,6 +4,7 @@
   "host": "{{ host_report.host }}",
   "instance_id": "{{ host_report.instance_id }}",
   "status": "{{ host_report.status }}",
+  "upgrade_mode": "{{ host_report.upgrade_mode | default('full') }}",
   "skip_reason": {{ host_report.skip_reason | to_nice_json_safe }},
   "snapshot_id": "{{ host_report.snapshot_id | default('') }}",
   "pre_snapshot": {

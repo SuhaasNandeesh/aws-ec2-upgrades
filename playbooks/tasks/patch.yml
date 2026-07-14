@@ -12,6 +12,44 @@
     upgrade_failed: false
     upgrade_error: ""
 
+- name: Determine upgrade mode and initialize target package list
+  ansible.builtin.set_fact:
+    upgrade_mode: "{{ 'full' if full_upgrade | default(false) | bool else 'inspector' }}"
+    upgrade_skipped: false
+    upgrade_skip_reason: ""
+    target_packages: []
+
+- name: Load Inspector manifest (inspector mode only)
+  ansible.builtin.set_fact:
+    _inspector_manifest: "{{ lookup('file', inspector_manifest) | from_json }}"
+  when:
+    - not full_upgrade | default(false) | bool
+    - inspector_manifest is defined and inspector_manifest | length > 0
+
+- name: Extract target packages for this host from manifest
+  ansible.builtin.set_fact:
+    target_packages: "{{ _inspector_manifest.get(inventory_hostname, []) }}"
+  when:
+    - not full_upgrade | default(false) | bool
+    - _inspector_manifest is defined
+
+- name: Mark host as skipped if not in manifest (inspector mode)
+  ansible.builtin.set_fact:
+    upgrade_skipped: true
+    upgrade_skip_reason: >-
+      {{
+        'No inspector manifest provided; use --inspector-manifest or --full-upgrade'
+        if not (inspector_manifest is defined and inspector_manifest | length > 0)
+        else 'Host not found in inspector manifest'
+      }}
+  when:
+    - not full_upgrade | default(false) | bool
+    - target_packages | length == 0
+
+- name: End host if upgrade skipped (not in inspector manifest)
+  ansible.builtin.meta: end_host
+  when: upgrade_skipped | default(false) | bool
+
 - name: Disable unattended-upgrades to avoid apt lock contention
   ansible.builtin.systemd:
     name: unattended-upgrades
@@ -49,7 +87,7 @@
       environment:
         DEBIAN_FRONTEND: noninteractive
 
-    - name: apt-get dist-upgrade (noninteractive)
+    - name: apt-get dist-upgrade (full upgrade fallback, noninteractive)
       ansible.builtin.apt:
         upgrade: dist
         dpkg_options: "force-confold,force-confdef"
@@ -57,6 +95,21 @@
       environment:
         DEBIAN_FRONTEND: noninteractive
         NEEDRESTART_MODE: a
+      when: full_upgrade | default(false) | bool
+
+    - name: apt-get upgrade targeted packages (Inspector-driven, noninteractive)
+      ansible.builtin.apt:
+        name: "{{ target_packages }}"
+        state: latest
+        only_upgrade: true
+        dpkg_options: "force-confold,force-confdef"
+        force_apt_get: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+        NEEDRESTART_MODE: a
+      when:
+        - not full_upgrade | default(false) | bool
+        - target_packages is defined and target_packages | length > 0
 
     - name: Autoremove obsolete packages to free disk space
       ansible.builtin.apt:

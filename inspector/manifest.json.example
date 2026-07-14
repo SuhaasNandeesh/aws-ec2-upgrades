@@ -1,0 +1,5 @@
+{
+  "i-0123456789abcdef0": ["openssl", "libssl3", "nginx", "libcurl4", "libexpat1"],
+  "i-0abcdef123456789": ["python3.10", "libc6", "libssl3", "tar", "curl"],
+  "i-0fedcba987654321": ["linux-image-5.15.0-1025-aws", "linux-headers-5.15.0-1025-aws"]
+}

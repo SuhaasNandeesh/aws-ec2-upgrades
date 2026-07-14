@@ -201,11 +201,12 @@
   serial: 5
   ignore_unreachable: true
   tasks:
-    - name: Skip hosts that failed preflight, upgrade, or earlier phases
+    - name: Skip hosts that failed preflight, upgrade, were skipped, or earlier phases
       ansible.builtin.meta: end_host
       when: >
         preflight_status | default('skipped') not in ['ready', 'bootstrapped']
         or upgrade_failed | default(false) | bool
+        or upgrade_skipped | default(false) | bool
         or phase_error | default('') | length > 0
 
     - name: Reboot and reconnect (with error capture)
@@ -270,11 +271,12 @@
   serial: 5
   ignore_unreachable: true
   tasks:
-    - name: Skip hosts that failed preflight, upgrade, or earlier phases
+    - name: Skip hosts that failed preflight, upgrade, were skipped, or earlier phases
       ansible.builtin.meta: end_host
       when: >
         preflight_status | default('skipped') not in ['ready', 'bootstrapped']
         or upgrade_failed | default(false) | bool
+        or upgrade_skipped | default(false) | bool
         or phase_error | default('') | length > 0
 
     - name: Collect post-upgrade facts and verify (with error capture)
@@ -323,6 +325,7 @@
       when: >
         preflight_status | default('skipped') not in ['ready', 'bootstrapped']
         or upgrade_failed | default(false) | bool
+        or upgrade_skipped | default(false) | bool
         or phase_error | default('') | length > 0
 
     - name: Determine account group
@@ -342,6 +345,7 @@
           host: "{{ inventory_hostname }}"
           instance_id: "{{ inventory_hostname }}"
           status: "patched"
+          upgrade_mode: "{{ upgrade_mode | default('full') }}"
           skip_reason: ""
           snapshot_id: "{{ prepatch_snapshot_id | default('') }}"
           pre_snapshot:
@@ -411,6 +415,7 @@
       when: >
         preflight_status | default('skipped') in ['ready', 'bootstrapped']
         and not upgrade_failed | default(false) | bool
+        and not upgrade_skipped | default(false) | bool
         and phase_error | default('') | length == 0
 
     - name: Determine account group
@@ -428,13 +433,15 @@
           {{
             'error' if phase_error | default('') | length > 0
             else ('error' if upgrade_failed | default(false) | bool
-            else preflight_status | default('skipped'))
+            else ('skipped' if upgrade_skipped | default(false) | bool
+            else preflight_status | default('skipped')))
           }}
         _report_reason: >-
           {{
             phase_error | default('') if phase_error | default('') | length > 0
             else (upgrade_error | default('') if upgrade_failed | default(false) | bool
-            else preflight_reason | default(''))
+            else (upgrade_skip_reason | default('') if upgrade_skipped | default(false) | bool
+            else preflight_reason | default('')))
           }}
 
     - name: Build host report for skipped/error/failed host
@@ -445,6 +452,7 @@
           host: "{{ inventory_hostname }}"
           instance_id: "{{ inventory_hostname }}"
           status: "{{ _report_status }}"
+          upgrade_mode: "{{ upgrade_mode | default('full') }}"
           skip_reason: "{{ _report_reason }}"
           snapshot_id: "{{ prepatch_snapshot_id | default('') }}"
           pre_snapshot:
@@ -539,6 +547,7 @@
           host: "{{ inventory_hostname }}"
           instance_id: "{{ inventory_hostname }}"
           status: "error"
+          upgrade_mode: "{{ upgrade_mode | default('full') }}"
           skip_reason: >-
             {{
               'Host unreachable - SSM connection failed'
